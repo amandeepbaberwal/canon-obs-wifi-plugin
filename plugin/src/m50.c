@@ -806,6 +806,10 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
     }
   }
 
+  /* One full event dump: right after bootstrap the camera reports its
+   * complete property state (aperture/shutter/ISO/focus...). */
+  poll_events_logged(s, 10000, phase);
+
   msleep(1000);
   return s;
 }
