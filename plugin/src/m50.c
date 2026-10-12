@@ -605,6 +605,30 @@ static int poll_events(m50_session *s, int timeout_ms)
   return r < 0 ? -1 : 0;
 }
 
+/* Plain Canon command that must end OK; BUSY/NOT-READY retried ~8s. */
+static int op_ok(m50_session *s, const char *name, uint16_t op, const uint32_t *params, int nparams,
+                 int timeout_ms)
+{
+  static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  DWORD deadline = GetTickCount() + 8000;
+  for (;;) {
+    uint8_t *d = NULL;
+    int dl = 0;
+    int code = cam_command(s, s->cmd, op, params, nparams, acc, 3, &d, &dl, timeout_ms);
+    free(d);
+    if (code == R_OK)
+      return 0;
+    if ((code == R_BUSY || code == R_NOT_READY) && GetTickCount() < deadline) {
+      if (poll_events(s, timeout_ms) != 0)
+        return -1;
+      msleep(100);
+      continue;
+    }
+    set_err("%s failed 0x%x", name, code < 0 ? 0xffff : (unsigned)code);
+    return -1;
+  }
+}
+
 static int write_prop_retry(m50_session *s, uint32_t prop, uint32_t value, int vlen, int timeout_ms)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
@@ -712,43 +736,20 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
 
   /* Canon Live View bootstrap (T100-verified, M50-verified 2026-10-12) */
   {
-    int code;
-    code = 0;
-    {
-      uint32_t p = 1;
-      uint8_t *dd = NULL;
-      int ddl = 0;
-      code = cam_command(s, s->cmd, EOS_SET_REMOTE_MODE, &p, 1, acc_all, 3, &dd, &ddl, 10000);
-      free(dd);
-      if (code != R_OK) {
-        set_err("SetRemoteMode failed 0x%x", code);
-        teardown(s);
-        return NULL;
-      }
+    uint32_t p1 = 1;
+    if (op_ok(s, "SetRemoteMode", EOS_SET_REMOTE_MODE, &p1, 1, 10000) != 0) {
+      teardown(s);
+      return NULL;
     }
-    {
-      uint32_t p = 1;
-      uint8_t *dd = NULL;
-      int ddl = 0;
-      code = cam_command(s, s->cmd, EOS_SET_EVENT_MODE, &p, 1, acc_all, 3, &dd, &ddl, 10000);
-      free(dd);
-      if (code != R_OK) {
-        set_err("SetEventMode failed 0x%x", code);
-        teardown(s);
-        return NULL;
-      }
+    uint32_t p2 = 1;
+    if (op_ok(s, "SetEventMode", EOS_SET_EVENT_MODE, &p2, 1, 10000) != 0) {
+      teardown(s);
+      return NULL;
     }
-    {
-      uint32_t p = 0x1fff;
-      uint8_t *dd = NULL;
-      int ddl = 0;
-      code = cam_command(s, s->cmd, EOS_SET_CAPACITY, &p, 1, acc_all, 3, &dd, &ddl, 10000);
-      free(dd);
-      if (code != R_OK) {
-        set_err("SetCapacity failed 0x%x", code);
-        teardown(s);
-        return NULL;
-      }
+    uint32_t p3 = 0x1fff;
+    if (op_ok(s, "SetCapacity", EOS_SET_CAPACITY, &p3, 1, 10000) != 0) {
+      teardown(s);
+      return NULL;
     }
     if (poll_events(s, 10000) != 0) {
       teardown(s);
@@ -760,12 +761,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
     }
     {
       uint32_t pp[3] = { 0x0fffffff, 0x1000, 1 };
-      uint8_t *dd = NULL;
-      int ddl = 0;
-      code = cam_command(s, s->cmd, EOS_SET_PC_CONNECT, pp, 3, acc_all, 3, &dd, &ddl, 10000);
-      free(dd);
-      if (code != R_OK) {
-        set_err("SetPcConnectMode failed 0x%x", code);
+      if (op_ok(s, "SetPcConnectMode", EOS_SET_PC_CONNECT, pp, 3, 10000) != 0) {
         teardown(s);
         return NULL;
       }
@@ -775,10 +771,12 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
       return NULL;
     }
     if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000) != 0) {
-      teardown(s);
-      return NULL;
+      /* Fresh Movie mode refuses this write; the output select below is
+       * what actually starts the feed. Non-fatal by hardware evidence. */
+      phase("EVF mode write refused, continuing");
+    } else {
+      phase("EVF mode set");
     }
-    phase("EVF mode set");
     /* M50/DIGIC-8 output modes: 0 none, 1 camera, 2 host, 3 cameraAndHost.
      * cameraAndHost keeps the LCD live while streaming to the PC. */
     if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000) != 0) {
@@ -835,6 +833,182 @@ int m50_keepalive(m50_session *s)
   int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, 10000);
   free(d);
   return r < 0 ? -1 : 0;
+}
+
+void m50_raw_close(void *vs)
+{
+  m50_disconnect((m50_session *)vs);
+}
+
+int m50_raw_connect(const char *host, int port, const char *local_address, int init_timeout_ms,
+                    void **sess_out)
+{
+  *sess_out = NULL;
+  if (ensure_ws() != 0)
+    return -1;
+  m50_session *s = (m50_session *)calloc(1, sizeof(*s));
+  if (!s) {
+    set_err("out of memory");
+    return -1;
+  }
+  s->cmd = INVALID_SOCKET;
+  s->evt = INVALID_SOCKET;
+  s->txn = 1;
+  static const uint16_t acc_ok[] = { R_OK };
+  s->cmd = dial(host, port, local_address, 10000);
+  if (s->cmd == INVALID_SOCKET) {
+    free(s);
+    return -1;
+  }
+  s->evt = dial(host, port, local_address, 10000);
+  if (s->evt == INVALID_SOCKET) {
+    closesocket(s->cmd);
+    free(s);
+    return -1;
+  }
+  uint32_t conn = 0;
+  if (init_command(s->cmd, &conn, init_timeout_ms) != 0) {
+    teardown(s);
+    return -1;
+  }
+  s->session_id = conn;
+  if (init_event(s->evt, conn, 10000) != 0) {
+    teardown(s);
+    return -1;
+  }
+  {
+    uint8_t *d = NULL;
+    int dl = 0;
+    if (cam_command(s, s->cmd, MTP_OPEN_SESSION, &conn, 1, acc_ok, 1, &d, &dl, 10000) < 0) {
+      free(d);
+      teardown(s);
+      return -1;
+    }
+    free(d);
+  }
+  {
+    uint8_t *d = NULL;
+    int dl = 0;
+    if (cam_command(s, s->cmd, MTP_GET_DEVICE_INFO, NULL, 0, acc_ok, 1, &d, &dl, 10000) < 0) {
+      free(d);
+      teardown(s);
+      return -1;
+    }
+    free(d);
+  }
+  *sess_out = s;
+  return 0;
+}
+
+int m50_raw_bootstrap(void *vs, int minimal)
+{
+  return m50_raw_bootstrap_tol(vs, minimal, 0);
+}
+
+int m50_raw_bootstrap_tol(void *vs, int minimal, int tolerant)
+{
+  m50_session *s = (m50_session *)vs;
+  static const uint16_t acc_all[] = { R_OK, R_BUSY, R_NOT_READY };
+  /* Plain commands: retry BUSY/NOT-READY briefly (movie transitions lag). */
+#define OP(name, op, pp, np)                                                  \
+  do {                                                                        \
+    DWORD dl = GetTickCount() + 8000;                                         \
+    for (;;) {                                                                \
+      uint8_t *dd = NULL;                                                     \
+      int ddl = 0;                                                            \
+      int cc = cam_command(s, s->cmd, (op), (pp), (np), acc_all, 3, &dd, &ddl, \
+                           10000);                                            \
+      free(dd);                                                               \
+      if (cc == R_OK)                                                         \
+        break;                                                                \
+      if ((cc == R_BUSY || cc == R_NOT_READY) && GetTickCount() < dl) {       \
+        poll_events(s, 10000);                                                \
+        msleep(100);                                                          \
+        continue;                                                             \
+      }                                                                       \
+      printf("FAIL %s code=0x%x\n", (name), cc < 0 ? 0xffff : (unsigned)cc);   \
+      return -1;                                                              \
+    }                                                                         \
+    printf("ok %s\n", (name));                                                \
+  } while (0)
+  {
+    uint32_t p = 1;
+    OP("remote", EOS_SET_REMOTE_MODE, &p, 1);
+  }
+  {
+    uint32_t p = 1;
+    OP("eventmode", EOS_SET_EVENT_MODE, &p, 1);
+  }
+  if (!minimal) {
+    uint32_t p = 0x1fff;
+    OP("capacity", EOS_SET_CAPACITY, &p, 1);
+    if (poll_events(s, 10000) != 0) {
+      printf("FAIL poll\n");
+      return -1;
+    }
+    if (write_prop_retry(s, PROP_CAPACITY, 4, 4, 10000) != 0) {
+      printf("FAIL d11c: %s\n", m50_last_error());
+      return -1;
+    }
+    printf("ok d11c\n");
+    {
+      uint32_t pp[3] = { 0x0fffffff, 0x1000, 1 };
+      OP("pcconnect", EOS_SET_PC_CONNECT, pp, 3);
+    }
+    if (poll_events(s, 10000) != 0) {
+      printf("FAIL poll\n");
+      return -1;
+    }
+  }
+  if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000) != 0) {
+    if (tolerant) {
+      printf("warn evfmode: %s (continuing)\n", m50_last_error());
+    } else {
+      printf("FAIL evfmode: %s\n", m50_last_error());
+      return -1;
+    }
+  } else {
+    printf("ok evfmode\n");
+  }
+  if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000) != 0) {
+    printf("FAIL evfout: %s\n", m50_last_error());
+    return -1;
+  }
+  printf("ok evfout\n");
+  if (poll_events(s, 10000) != 0) {
+    printf("FAIL poll\n");
+    return -1;
+  }
+  msleep(1000);
+  return 0;
+}
+
+int m50_raw_vf(void *vs, int p2, int p3, uint8_t **out_jpeg, int *out_len)
+{
+  m50_session *s = (m50_session *)vs;
+  static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  uint32_t params[3] = { 0x00200000, (uint32_t)p2, (uint32_t)p3 };
+  uint8_t *data = NULL;
+  int dlen = 0;
+  int code = cam_command(s, s->cmd, EOS_GET_VF_DATA, params, 3, acc, 3, &data, &dlen, 10000);
+  if (code < 0) {
+    free(data);
+    return -1;
+  }
+  if (code == R_BUSY || code == R_NOT_READY) {
+    free(data);
+    poll_events(s, 10000);
+    return 0;
+  }
+  uint8_t *jpg = NULL;
+  int jlen = 0;
+  int r = extract_jpeg(data, dlen, &jpg, &jlen);
+  free(data);
+  if (r <= 0)
+    return 0;
+  *out_jpeg = jpg;
+  *out_len = jlen;
+  return 1;
 }
 
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)

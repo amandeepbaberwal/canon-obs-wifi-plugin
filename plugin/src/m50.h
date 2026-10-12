@@ -38,6 +38,14 @@ void m50_close(m50_session *s);
 /* Best-effort CloseSession before closing sockets. */
 void m50_disconnect(m50_session *s);
 
+/* Headless probe hooks (m50-probe CLI): raw session without bootstrap. */
+int m50_raw_connect(const char *host, int port, const char *local_address, int init_timeout_ms,
+                    void **sess_out);
+int m50_raw_bootstrap(void *sess, int minimal);
+int m50_raw_bootstrap_tol(void *sess, int minimal, int tolerant);
+int m50_raw_vf(void *sess, int p2, int p3, uint8_t **out_jpeg, int *out_len);
+void m50_raw_close(void *sess);
+
 /* Optional phase logger (e.g. OBS log). */
 void m50_set_log(void (*cb)(const char *));
 
