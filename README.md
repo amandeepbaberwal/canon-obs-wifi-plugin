@@ -11,7 +11,7 @@ Also includes the `bridge/` fallback: a PTP/IP → MJPEG bridge (`http://127.0.0
   `GetViewFinderData (0x9153)` polling with `0xa102` warm-up handling.
 - Key finding: DIGIC-8 EVF output `0xd1b0` is an enum (`0 none / 1 camera / 2 host /
   3 cameraAndHost`). The plugin writes `3` so the LCD stays live while frames go to
-  the PC. Verified output: **480x320 MJPEG** (camera limitation; OBS scales it).
+  the PC. Verified output: **960x640 MJPEG** (camera limitation; OBS scales it).
 - SSDP discovery for `SmartPhoneEOSSystemService` / `RemoteControlEOSSystemService` /
   `WFTEOSSystemService`, UPnP descriptor verify, auto-pick of the router-facing PC
   interface, CloseSession teardown, 10s reconnect backoff.

@@ -94,13 +94,13 @@ static void m50_tick(void *data, float seconds){
 static uint32_t m50_width(void *data)
 {
   struct m50_ctx *ctx = (struct m50_ctx *)data;
-  return (uint32_t)(ctx->frame_w > 0 ? ctx->frame_w : 480);
+  return (uint32_t)(ctx->frame_w > 0 ? ctx->frame_w : 960);
 }
 
 static uint32_t m50_height(void *data)
 {
   struct m50_ctx *ctx = (struct m50_ctx *)data;
-  return (uint32_t)(ctx->frame_h > 0 ? ctx->frame_h : 320);
+  return (uint32_t)(ctx->frame_h > 0 ? ctx->frame_h : 640);
 }
 
 static void *capture_thread(void *arg)
@@ -278,8 +278,8 @@ static void *m50_create(obs_data_t *settings, obs_source_t *source)
   snprintf(ctx->status, sizeof(ctx->status), "Starting.");
   ctx->camera_ip = bstrdup(obs_data_get_string(settings, "camera_ip"));
   ctx->local_address = bstrdup(obs_data_get_string(settings, "local_address"));
-  ctx->frame_w = 480;
-  ctx->frame_h = 320;
+  ctx->frame_w = 960;
+  ctx->frame_h = 640;
   m50_set_log(m50_blog);
   start_thread(ctx);
   return ctx;
@@ -390,7 +390,7 @@ static void m50_get_defaults(obs_data_t *settings)
   obs_data_set_default_string(settings, "local_address", "192.168.1.43");
   obs_data_set_default_string(
     settings, "help",
-    "Wi-Fi preview is fixed 480x320 (camera limitation); OBS scales it. "
+    "Wi-Fi preview is fixed 960x640 (camera limitation); OBS scales it. "
     "No audio over this path. Camera: Wi-Fi function > Connect to smartphone (same router), "
     "waiting screen. Press Search cameras, or type the IP and press Pair now, then accept "
     "the prompt within 90s. Status details: Help > Log Files, search [m50].");
