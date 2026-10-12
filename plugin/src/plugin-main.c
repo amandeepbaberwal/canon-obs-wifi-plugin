@@ -121,66 +121,80 @@ static void *capture_thread(void *arg)
   snprintf(ip, sizeof(ip), "%s", ctx->camera_ip ? ctx->camera_ip : "");
   snprintf(local, sizeof(local), "%s", ctx->local_address ? ctx->local_address : "");
 
+  /* One mode check at startup. When an IP is already configured we then
+   * connect directly every round (no per-iteration sweep) so the first
+   * attempt lands inside the camera's short wait window. */
+  bool wft_guard = false;
+  if (ip[0] != '\0') {
+    char eff0[64] = "";
+    if (local[0])
+      snprintf(eff0, sizeof(eff0), "%s", local);
+    else if (!m50_pick_local(ip, eff0, sizeof(eff0)))
+      eff0[0] = '\0';
+    m50_found sweep0[M50_MAX_CAMERAS];
+    int ns0 = m50_discover(sweep0, M50_MAX_CAMERAS, 2500, eff0[0] ? eff0 : NULL);
+    wft_guard = ns0 > 0;
+    for (int i = 0; i < ns0; i++) {
+      if (strstr(sweep0[i].service, "SmartPhone") != NULL) {
+        wft_guard = false;
+        break;
+      }
+    }
+    if (wft_guard)
+      blog(LOG_WARNING, "[m50] camera in WFT mode; need smartphone mode");
+  }
+
   while (ctx->running) {
     /* Adopt a newly searched IP and honor manual pair requests. */
     pthread_mutex_lock(&ctx->lock);
     if (ctx->pending_ip[0]) {
       snprintf(ip, sizeof(ip), "%s", ctx->pending_ip);
       ctx->pending_ip[0] = '\0';
+      wft_guard = false;
     }
-    bool now = ctx->retry_now;
-    ctx->retry_now = false;
     pthread_mutex_unlock(&ctx->lock);
-    (void)now;
-    if (ip[0] == '\0') {
-      set_status(ctx, "Press Search cameras, or type the Camera IP.");
-      os_sleep_ms(1000);
+    if (wft_guard) {
+      set_status(ctx, "Camera is in EOS Utility mode: switch it to Wi-Fi function > "
+                      "Connect to smartphone, then press Pair.");
+      for (int i = 0; i < 100 && ctx->running && !ctx->retry_now; i++)
+        os_sleep_ms(100);
+      pthread_mutex_lock(&ctx->lock);
+      ctx->retry_now = false;
+      pthread_mutex_unlock(&ctx->lock);
       continue;
     }
-    /* Auto-select the router-facing local address when unset. */
+    if (ip[0] == '\0') {
+      /* No configured IP: sweep to find/adopt a smartphone camera. */
+      char eff0[64] = "";
+      if (local[0])
+        snprintf(eff0, sizeof(eff0), "%s", local);
+      m50_found sweep[M50_MAX_CAMERAS];
+      int ns = m50_discover(sweep, M50_MAX_CAMERAS, 2500, eff0[0] ? eff0 : NULL);
+      int smart = -1;
+      for (int i = 0; i < ns; i++) {
+        if (strstr(sweep[i].service, "SmartPhone") != NULL) {
+          smart = i;
+          break;
+        }
+      }
+      if (smart < 0) {
+        set_status(ctx, "No camera found. Press Search cameras, or type the Camera IP.");
+        os_sleep_ms(5000);
+        continue;
+      }
+      snprintf(ip, sizeof(ip), "%s", sweep[smart].ip);
+      blog(LOG_INFO, "[m50] auto-selected camera at %s", ip);
+    }
+    /* Fast path: connect immediately, no verify/sweep delays. */
     char eff_local[64] = "";
     if (local[0])
       snprintf(eff_local, sizeof(eff_local), "%s", local);
     else if (!m50_pick_local(ip, eff_local, sizeof(eff_local)))
       eff_local[0] = '\0';
-    /* Quick SSDP sweep: auto-adopt a smartphone-mode camera, and warn when
-     * the camera sits in EOS Utility (WFT) mode whose bootstrap differs. */
-    {
-      m50_found sweep[M50_MAX_CAMERAS];
-      int ns = m50_discover(sweep, M50_MAX_CAMERAS, 2500, eff_local[0] ? eff_local : NULL);
-      int smart = -1, wft_only = 1;
-      for (int i = 0; i < ns; i++) {
-        if (strstr(sweep[i].service, "SmartPhone") != NULL) {
-          smart = i;
-          wft_only = 0;
-        } else if (strstr(sweep[i].service, "WFTEOS") == NULL &&
-                   strstr(sweep[i].service, "RemoteControl") == NULL) {
-          wft_only = 0;
-        }
-      }
-      if (smart >= 0 && ip[0] == '\0') {
-        snprintf(ip, sizeof(ip), "%s", sweep[smart].ip);
-        char msg[300];
-        snprintf(msg, sizeof(msg), "Auto-selected camera at %s.", ip);
-        set_status(ctx, msg);
-        blog(LOG_INFO, "[m50] %s", msg);
-      } else if (ns > 0 && wft_only) {
-        set_status(ctx, "Camera is in EOS Utility mode: switch it to Wi-Fi function > "
-                        "Connect to smartphone, then press Pair.");
-        blog(LOG_WARNING, "[m50] camera in WFT mode (%s); need smartphone mode", sweep[0].ip);
-        for (int i = 0; i < 100 && ctx->running && !ctx->retry_now; i++)
-          os_sleep_ms(100);
-        continue;
-      }
-    }
-    char model[128] = "";
-    if (m50_verify(ip, eff_local[0] ? eff_local : NULL, model, sizeof(model))) {
-      char msg[300];
-      snprintf(msg, sizeof(msg), "Found %.100s at %s. Connecting: accept any prompt (90s)...", model, ip);
-      set_status(ctx, msg);
-    } else {
-      set_status(ctx, "Connecting: accept any prompt on the camera (90s)...");
-    }
+    pthread_mutex_lock(&ctx->lock);
+    ctx->retry_now = false;
+    pthread_mutex_unlock(&ctx->lock);
+    set_status(ctx, "Connecting: accept any prompt on the camera (90s)...");
     m50_session *s = m50_connect(ip, 15740, eff_local[0] ? eff_local : NULL, 90000);
     if (!s) {
       char msg[300];
