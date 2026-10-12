@@ -25,78 +25,56 @@ struct m50_ctx {
   volatile bool running;
   volatile bool thread_alive;
   volatile bool retry_now;
+  volatile bool cancelled;
+  volatile bool conflict;
   pthread_mutex_t lock;
   char status[256];
   char pending_ip[64];
   m50_found cams[M50_MAX_CAMERAS];
   int ncams;
-  /* Latest decoded frame for synchronous output on the video thread. */
-  uint8_t *frame_buf;
-  size_t frame_cap;
   int frame_w;
   int frame_h;
-  int frame_stride;
-  unsigned long frame_seq;
-  unsigned long frame_shown;
-  unsigned long tick_outputs;
-  uint64_t frame_ts;
 };
+
+/* Process-wide guard: one PTP/IP client per camera. */
+static CRITICAL_SECTION g_inst_lock;
+static volatile bool g_inst_init = false;
+static volatile LONG g_inst_started = 0;
+static int g_live_count = 0;
+static char g_live_ip[64] = "";
+
+static void inst_lock(void)
+{
+  if (!g_inst_init) {
+    if (InterlockedCompareExchange(&g_inst_started, 1, 0) == 0) {
+      InitializeCriticalSection(&g_inst_lock);
+      g_inst_init = true;
+    } else {
+      while (!g_inst_init)
+        Sleep(1);
+    }
+  }
+  EnterCriticalSection(&g_inst_lock);
+}
+
+static void inst_unlock(void)
+{
+  LeaveCriticalSection(&g_inst_lock);
+}
 
 static void set_status(struct m50_ctx *ctx, const char *text)
 {
   pthread_mutex_lock(&ctx->lock);
   snprintf(ctx->status, sizeof(ctx->status), "%s", text ? text : "");
   pthread_mutex_unlock(&ctx->lock);
-}
-
-/* Worker only decodes into the latest-frame slot; the video thread pushes it
- * out synchronously each tick so OBS never sits on a queue of stale frames. */
-static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, int stride,
-                        uint64_t ts)
-{
-  size_t need = (size_t)h * (size_t)stride;
-  pthread_mutex_lock(&ctx->lock);
-  if (need > ctx->frame_cap) {
-    uint8_t *nb = (uint8_t *)brealloc(ctx->frame_buf, need);
-    if (!nb) {
-      pthread_mutex_unlock(&ctx->lock);
-      return;
+  /* Persist so the Properties dialog shows it on open. */
+  if (ctx->source) {
+    obs_data_t *s = obs_source_get_settings(ctx->source);
+    if (s) {
+      obs_data_set_string(s, "live_status", text ? text : "");
+      obs_data_release(s);
     }
-    ctx->frame_buf = nb;
-    ctx->frame_cap = need;
   }
-  memcpy(ctx->frame_buf, bgra, need);
-  ctx->frame_w = w;
-  ctx->frame_h = h;
-  ctx->frame_stride = stride;
-  ctx->frame_ts = ts;
-  ctx->frame_seq++;
-  pthread_mutex_unlock(&ctx->lock);
-}
-
-static void m50_tick(void *data, float seconds){
-  (void)seconds;
-  struct m50_ctx *ctx = (struct m50_ctx *)data;
-  pthread_mutex_lock(&ctx->lock);
-  if (!ctx->frame_buf || ctx->frame_seq == ctx->frame_shown) {
-    pthread_mutex_unlock(&ctx->lock);
-    return;
-  }
-  struct obs_source_frame frame;
-  memset(&frame, 0, sizeof(frame));
-  frame.format = VIDEO_FORMAT_BGRX;
-  frame.width = (uint32_t)ctx->frame_w;
-  frame.height = (uint32_t)ctx->frame_h;
-  frame.linesize[0] = (uint32_t)ctx->frame_stride;
-  frame.data[0] = ctx->frame_buf;
-  frame.timestamp = ctx->frame_ts;
-  ctx->frame_shown = ctx->frame_seq;
-  ctx->tick_outputs++;
-  if (ctx->tick_outputs <= 3 || ctx->tick_outputs % 600 == 0)
-    blog(LOG_INFO, "[m50] tick output #%lu %dx%d ts=%llu", ctx->tick_outputs, ctx->frame_w,
-         ctx->frame_h, (unsigned long long)frame.timestamp);
-  obs_source_output_video(ctx->source, &frame);
-  pthread_mutex_unlock(&ctx->lock);
 }
 
 static uint32_t m50_width(void *data)
@@ -111,10 +89,27 @@ static uint32_t m50_height(void *data)
   return (uint32_t)(ctx->frame_h > 0 ? ctx->frame_h : 640);
 }
 
+static void wait_retry(struct m50_ctx *ctx, int ms)
+{
+  for (int i = 0; i < ms / 100 && ctx->running && !ctx->cancelled && !ctx->retry_now; i++)
+    os_sleep_ms(100);
+  pthread_mutex_lock(&ctx->lock);
+  ctx->retry_now = false;
+  pthread_mutex_unlock(&ctx->lock);
+}
+
 static void *capture_thread(void *arg)
 {
   struct m50_ctx *ctx = (struct m50_ctx *)arg;
   CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  m50_set_cancel(&ctx->cancelled);
+  if (ctx->conflict) {
+    set_status(ctx, "Camera in use by another M50 source in OBS.");
+    blog(LOG_WARNING, "[m50] duplicate source for this camera; not connecting");
+    ctx->thread_alive = false;
+    CoUninitialize();
+    return NULL;
+  }
 
   char ip[64] = "";
   char local[64] = "";
@@ -144,7 +139,8 @@ static void *capture_thread(void *arg)
       blog(LOG_WARNING, "[m50] camera in WFT mode; need smartphone mode");
   }
 
-  while (ctx->running) {
+  int fails = 0, dial_tmo = 0;
+  while (ctx->running && !ctx->cancelled) {
     /* Adopt a newly searched IP and honor manual pair requests. */
     pthread_mutex_lock(&ctx->lock);
     if (ctx->pending_ip[0]) {
@@ -197,22 +193,50 @@ static void *capture_thread(void *arg)
     set_status(ctx, "Connecting: accept any prompt on the camera (90s)...");
     m50_session *s = m50_connect(ip, 15740, eff_local[0] ? eff_local : NULL, 90000);
     if (!s) {
-      char msg[300];
-      snprintf(msg, sizeof(msg), "Connect failed: %.220s", m50_last_error());
+      char err[512], msg[300];
+      snprintf(err, sizeof(err), "%s", m50_last_error());
+      snprintf(msg, sizeof(msg), "Connect failed: %.220s", err);
       set_status(ctx, msg);
       blog(LOG_WARNING, "[m50] %s", msg);
-      for (int i = 0; i < 30 && ctx->running && !ctx->retry_now; i++)
-        os_sleep_ms(100);
+      fails++;
+      if (strstr(err, "ECONNRESET") != NULL || strstr(err, "10054") != NULL) {
+        wait_retry(ctx, 15000);
+      } else if (strstr(err, "timed out") != NULL || strstr(err, "ETIMEDOUT") != NULL ||
+                 strstr(err, "refused") != NULL || strstr(err, "ECONNREFUSED") != NULL) {
+        if (++dial_tmo >= 3) {
+          set_status(ctx, "Camera not listening. Dismiss any error on the camera, re-enter "
+                          "Wi-Fi > Connect to smartphone (waiting screen), then press Pair.");
+          blog(LOG_WARNING, "[m50] dial failing; auto-retry paused until Pair");
+          while (ctx->running && !ctx->cancelled && !ctx->retry_now)
+            os_sleep_ms(500);
+          pthread_mutex_lock(&ctx->lock);
+          ctx->retry_now = false;
+          pthread_mutex_unlock(&ctx->lock);
+          dial_tmo = 0;
+        } else {
+          int waits[] = { 3000, 6000, 12000, 24000, 30000 };
+          int w = waits[fails - 1 < 5 ? fails - 1 : 4];
+          if (w > 30000)
+            w = 30000;
+          wait_retry(ctx, w);
+        }
+      } else {
+        wait_retry(ctx, 3000);
+      }
       continue;
     }
+    fails = 0;
+    dial_tmo = 0;
     set_status(ctx, "Streaming.");
     blog(LOG_INFO, "[m50] connected, EVF bootstrap done; waiting for first frame");
 
     int transient_run = 0;
     long total_frames = 0;
     int wic_fails = 0;
-    DWORD last_frame_ms = GetTickCount();
-    while (ctx->running) {
+    int ev_stage = 0;
+    DWORD birth_ms = GetTickCount();
+    DWORD last_frame_ms = birth_ms;
+    while (ctx->running && !ctx->cancelled) {
       uint8_t *jpeg = NULL;
       int jlen = 0;
       int r = m50_get_frame(s, &jpeg, &jlen);
@@ -229,13 +253,32 @@ static void *capture_thread(void *arg)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x100 (camera may need a moment)");
         else if (transient_run > 100 && transient_run % 600 == 0)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x%d", transient_run);
+        /* Escalate only while no frame has ever arrived on this session. */
+        if (total_frames == 0) {
+          DWORD el = GetTickCount() - birth_ms;
+          if (el > 3000 && ev_stage == 0) {
+            ev_stage = 1;
+            blog(LOG_INFO, "[m50] no frames yet; restarting EVF (3)");
+            if (m50_restart_evf(s, 3) != 0)
+              blog(LOG_WARNING, "[m50] EVF restart failed: %s", m50_last_error());
+          } else if (el > 8000 && ev_stage == 1) {
+            ev_stage = 2;
+            blog(LOG_INFO, "[m50] no frames yet; restarting EVF (2)");
+            if (m50_restart_evf(s, 2) != 0)
+              blog(LOG_WARNING, "[m50] EVF restart failed: %s", m50_last_error());
+          } else if (el > 15000) {
+            set_status(ctx, "No frames from camera; reconnecting.");
+            blog(LOG_WARNING, "[m50] no frames in 15s; reconnecting");
+            break;
+          }
+        }
         /* Idle watchdog only: never interrupt steady streaming. */
         if (GetTickCount() - last_frame_ms > 5000) {
           last_frame_ms = GetTickCount();
           if (m50_keepalive(s) != 0)
             blog(LOG_WARNING, "[m50] keepalive poll failed");
         }
-        os_sleep_ms(50);
+        os_sleep_ms(100);
         continue;
       }
       transient_run = 0;
@@ -243,35 +286,23 @@ static void *capture_thread(void *arg)
       uint8_t *bgra = NULL;
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
-        store_frame(ctx, bgra, w, h, stride, os_gettime_ns());
-        if (++total_frames == 1) {
+        struct obs_source_frame f;
+        memset(&f, 0, sizeof(f));
+        f.format = VIDEO_FORMAT_BGRX;
+        f.width = (uint32_t)w;
+        f.height = (uint32_t)h;
+        f.linesize[0] = (uint32_t)stride;
+        f.data[0] = bgra;
+        f.full_range = true;
+        f.timestamp = os_gettime_ns();
+        pthread_mutex_lock(&ctx->lock);
+        ctx->frame_w = w;
+        ctx->frame_h = h;
+        obs_source_output_video(ctx->source, &f);
+        pthread_mutex_unlock(&ctx->lock);
+        if (++total_frames == 1)
           blog(LOG_INFO, "[m50] first frame: %dx%d (%d bytes jpeg)", w, h, jlen);
-          /* Debug dump: %TEMP%\m50_firstframe.bmp for visual verification. */
-          HANDLE f = CreateFileA("C:\\Windows\\Temp\\m50_firstframe.bmp", GENERIC_WRITE, 0, NULL,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-          if (f != INVALID_HANDLE_VALUE) {
-            BITMAPFILEHEADER fh;
-            BITMAPINFOHEADER ih;
-            memset(&fh, 0, sizeof(fh));
-            memset(&ih, 0, sizeof(ih));
-            DWORD row = (DWORD)stride * (DWORD)h;
-            fh.bfType = 0x4D42;
-            fh.bfOffBits = sizeof(fh) + sizeof(ih);
-            fh.bfSize = fh.bfOffBits + row;
-            ih.biSize = sizeof(ih);
-            ih.biWidth = w;
-            ih.biHeight = -h;
-            ih.biPlanes = 1;
-            ih.biBitCount = 32;
-            ih.biCompression = BI_RGB;
-            DWORD wr = 0;
-            WriteFile(f, &fh, sizeof(fh), &wr, NULL);
-            WriteFile(f, &ih, sizeof(ih), &wr, NULL);
-            WriteFile(f, bgra, row, &wr, NULL);
-            CloseHandle(f);
-            blog(LOG_INFO, "[m50] wrote C:\\Windows\\Temp\\m50_firstframe.bmp");
-          }
-        } else if (total_frames % 1200 == 0)
+        else if (total_frames % 1200 == 0)
           blog(LOG_INFO, "[m50] %ld frames", total_frames);
       } else if (++wic_fails <= 3) {
         blog(LOG_WARNING, "[m50] JPEG decode failed (%d bytes)", jlen);
@@ -279,9 +310,12 @@ static void *capture_thread(void *arg)
       free(bgra);
       free(jpeg);
     }
+    /* Unfreeze OBS instead of holding the last frame. */
+    obs_source_output_video(ctx->source, NULL);
     m50_disconnect(s);
-    if (ctx->running)
-      os_sleep_ms(1000);
+    fails++;
+    if (ctx->running && !ctx->cancelled)
+      wait_retry(ctx, 5000);
   }
 
   set_status(ctx, "Stopped.");
@@ -303,6 +337,7 @@ static const char *m50_get_name(void *unused)
 
 static void start_thread(struct m50_ctx *ctx)
 {
+  ctx->cancelled = false;
   ctx->running = true;
   ctx->thread_alive = true;
   if (pthread_create(&ctx->thread, NULL, capture_thread, ctx) != 0) {
@@ -313,6 +348,7 @@ static void start_thread(struct m50_ctx *ctx)
 
 static void stop_thread(struct m50_ctx *ctx)
 {
+  ctx->cancelled = true;
   ctx->running = false;
   if (ctx->thread_alive)
     pthread_join(ctx->thread, NULL);
@@ -328,6 +364,17 @@ static void *m50_create(obs_data_t *settings, obs_source_t *source)
   ctx->local_address = bstrdup(obs_data_get_string(settings, "local_address"));
   ctx->frame_w = 960;
   ctx->frame_h = 640;
+  inst_lock();
+  if (g_live_count > 0) {
+    ctx->conflict = true;
+    snprintf(ctx->status, sizeof(ctx->status),
+             "Camera in use by another M50 source; remove the duplicate.");
+  } else {
+    g_live_count = 1;
+    snprintf(g_live_ip, sizeof(g_live_ip), "%s", ctx->camera_ip ? ctx->camera_ip : "");
+  }
+  inst_unlock();
+  obs_source_set_async_unbuffered(source, true);
   m50_set_log(m50_blog);
   start_thread(ctx);
   return ctx;
@@ -337,10 +384,15 @@ static void m50_destroy(void *data)
 {
   struct m50_ctx *ctx = (struct m50_ctx *)data;
   stop_thread(ctx);
+  inst_lock();
+  if (!ctx->conflict) {
+    g_live_count = 0;
+    g_live_ip[0] = '\0';
+  }
+  inst_unlock();
   pthread_mutex_destroy(&ctx->lock);
   bfree(ctx->camera_ip);
   bfree(ctx->local_address);
-  bfree(ctx->frame_buf);
   bfree(ctx);
 }
 
@@ -361,6 +413,10 @@ static void m50_update(void *data, obs_data_t *settings)
   bfree(ctx->local_address);
   ctx->camera_ip = bstrdup(nip);
   ctx->local_address = bstrdup(nloc);
+  inst_lock();
+  if (!ctx->conflict)
+    snprintf(g_live_ip, sizeof(g_live_ip), "%s", nip ? nip : "");
+  inst_unlock();
   start_thread(ctx);
 }
 
@@ -420,39 +476,40 @@ static obs_properties_t *m50_properties(void *data)
 {
   struct m50_ctx *ctx = (struct m50_ctx *)data;
   obs_properties_t *props = obs_properties_create();
-  obs_properties_add_text(props, "camera_ip", "Camera IP (router LAN, e.g. 192.168.1.53)",
+  obs_properties_add_text(props, "camera_ip", "Camera IP (router LAN, blank = auto-find)",
                           OBS_TEXT_DEFAULT);
   obs_properties_add_text(props, "local_address",
                           "PC local address (blank = auto-pick router-facing interface)",
                           OBS_TEXT_DEFAULT);
   obs_properties_add_button2(props, "search", "Search cameras on LAN", search_clicked, data);
   obs_properties_add_button2(props, "pair", "Pair now (camera in pairing mode)", pair_clicked, data);
-  obs_property_t *info = obs_properties_add_text(props, "help", "Setup", OBS_TEXT_INFO);
-  obs_property_text_set_info_type(info, OBS_TEXT_INFO_NORMAL);
+  obs_property_t *live = obs_properties_add_text(props, "live_status", "Live status", OBS_TEXT_INFO);
+  obs_property_text_set_info_type(live, OBS_TEXT_INFO_NORMAL);
+  obs_property_t *help = obs_properties_add_text(props, "help", "Setup", OBS_TEXT_INFO);
+  obs_property_text_set_info_type(help, OBS_TEXT_INFO_NORMAL);
   return props;
 }
 
 static void m50_get_defaults(obs_data_t *settings)
 {
-  obs_data_set_default_string(settings, "camera_ip", "192.168.1.53");
-  obs_data_set_default_string(settings, "local_address", "192.168.1.43");
+  obs_data_set_default_string(settings, "camera_ip", "");
+  obs_data_set_default_string(settings, "local_address", "");
   obs_data_set_default_string(
     settings, "help",
-    "Wi-Fi preview is fixed 960x640 (camera limitation); OBS scales it. "
-    "No audio over this path. Camera: Wi-Fi function > Connect to smartphone (same router), "
-    "waiting screen. Press Search cameras, or type the IP and press Pair now, then accept "
-    "the prompt within 90s. Status details: Help > Log Files, search [m50].");
+    "Camera: Wi-Fi function > Connect to smartphone (same router), waiting screen. "
+    "Press Search cameras, or type the IP and press Pair now, then accept the prompt "
+    "within 90s. Preview size follows the camera feed. No audio over this path. "
+    "Status details: Help > Log Files, search [m50].");
 }
 
 static struct obs_source_info m50_source_info = {
   .id = "m50_wifi_source",
   .type = OBS_SOURCE_TYPE_INPUT,
-  .output_flags = OBS_SOURCE_ASYNC_VIDEO,
+  .output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE,
   .get_name = m50_get_name,
   .create = m50_create,
   .destroy = m50_destroy,
   .update = m50_update,
-  .video_tick = m50_tick,
   .get_width = m50_width,
   .get_height = m50_height,
   .get_properties = m50_properties,

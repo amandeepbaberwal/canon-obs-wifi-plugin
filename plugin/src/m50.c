@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,9 +57,19 @@ static __declspec(thread) char g_err[512];
 
 static void (*g_log)(const char *) = NULL;
 
+/* Set by the owning worker thread; wait_sock aborts promptly when set. */
+static __declspec(thread) volatile bool *g_cancel = NULL;
+
+static int ensure_ws(void);
+
 void m50_set_log(void (*cb)(const char *))
 {
   g_log = cb;
+}
+
+void m50_set_cancel(volatile bool *flag)
+{
+  g_cancel = flag;
 }
 
 static void phase(const char *msg)
@@ -74,10 +85,14 @@ const char *m50_last_error(void)
 
 static void set_err(const char *fmt, ...)
 {
+  /* Format into a local buffer first: callers sometimes pass g_err itself
+   * as an argument, which would alias the vsnprintf destination. */
+  char buf[sizeof(g_err)];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(g_err, sizeof(g_err), fmt, ap);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
+  memcpy(g_err, buf, sizeof(g_err));
 }
 
 struct m50_session {
@@ -86,6 +101,9 @@ struct m50_session {
   uint32_t txn;
   uint32_t session_id;
   int transient_n;
+  DWORD last_ev_tick;
+  int ev_dump_left;
+  int nojpeg_logged;
 };
 
 static uint32_t rd32le(const uint8_t *p)
@@ -103,22 +121,32 @@ static void wr32le(uint8_t *p, uint32_t v)
 
 static int wait_sock(SOCKET s, int want_read, int timeout_ms)
 {
-  fd_set fds;
-  FD_ZERO(&fds);
-  FD_SET(s, &fds);
-  struct timeval tv;
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
-  int n = select(0, want_read ? &fds : NULL, want_read ? NULL : &fds, NULL, &tv);
-  if (n == 0) {
-    set_err("timed out after %dms", timeout_ms);
-    return -1;
+  int waited = 0;
+  while (waited < timeout_ms) {
+    if (g_cancel && *g_cancel) {
+      set_err("cancelled");
+      return -1;
+    }
+    int slice = timeout_ms - waited;
+    if (slice > 100)
+      slice = 100;
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    struct timeval tv;
+    tv.tv_sec = slice / 1000;
+    tv.tv_usec = (slice % 1000) * 1000;
+    int n = select(0, want_read ? &fds : NULL, want_read ? NULL : &fds, NULL, &tv);
+    if (n < 0) {
+      set_err("select failed: %d", WSAGetLastError());
+      return -1;
+    }
+    if (n > 0)
+      return 0;
+    waited += slice;
   }
-  if (n < 0) {
-    set_err("select failed: %d", WSAGetLastError());
-    return -1;
-  }
-  return 0;
+  set_err("timed out after %dms", timeout_ms);
+  return -1;
 }
 
 static int send_all(SOCKET s, const uint8_t *buf, int len, int timeout_ms)
@@ -311,6 +339,12 @@ static int init_command(SOCKET s, uint32_t *conn_out, int timeout_ms)
   uint8_t *ack = read_payload(s, &alen, timeout_ms);
   if (!ack)
     return -1;
+  if (alen >= 8 && rd32le(ack) == 5) {
+    uint32_t reason = rd32le(ack + 4);
+    set_err("Camera refused: reason=%u (1=rejected, 2=busy, 3=unspecified)", reason);
+    free(ack);
+    return -1;
+  }
   if (alen < 28 || rd32le(ack) != PTP_INIT_ACK) {
     set_err("unexpected Init ACK (len %d)", alen);
     free(ack);
@@ -575,16 +609,6 @@ static void msleep(int ms)
   Sleep((DWORD)(ms > 0 ? ms : 0));
 }
 
-static int close_session(m50_session *s, int timeout_ms)
-{
-  static const uint16_t acc[] = { R_OK, R_BUSY, 0x2003 };
-  uint8_t *d = NULL;
-  int dl = 0;
-  int r = cam_command(s, s->cmd, 0x1003, NULL, 0, acc, 3, &d, &dl, timeout_ms);
-  free(d);
-  return r < 0 ? -1 : 0;
-}
-
 static void teardown(m50_session *s)
 {
   /* Just close the sockets. An explicit CloseSession makes the M50 show
@@ -592,12 +616,83 @@ static void teardown(m50_session *s)
   m50_close(s);
 }
 
+/* Service the event socket: drain packets, answer probes, notice closes. */
+static int service_event(m50_session *s)
+{
+  if (s->evt == INVALID_SOCKET)
+    return 0;
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(s->evt, &fds);
+  struct timeval tv = { 0, 0 };
+  if (select(0, &fds, NULL, NULL, &tv) <= 0)
+    return 0;
+  int len = 0;
+  uint8_t *p = read_payload(s->evt, &len, 2000);
+  if (!p) {
+    phase("event channel closed by camera");
+    closesocket(s->evt);
+    s->evt = INVALID_SOCKET;
+    return 0;
+  }
+  if (len >= 4 && rd32le(p) == 13) {
+    uint8_t pong[8];
+    wr32le(pong, 8);
+    wr32le(pong + 4, 14);
+    write_payload(s->evt, pong, 8, 2000);
+    phase("answered event probe");
+  } else if (len >= 4) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "event socket packet type=%u", rd32le(p));
+    phase(msg);
+  }
+  free(p);
+  return 0;
+}
+
+static void log_event_records(m50_session *s, const uint8_t *d, int dl)
+{
+  int rem = dl, off = 0, shown = 0, count = 0;
+  char msg[512];
+  int len = snprintf(msg, sizeof(msg), "ev %d bytes:", dl);
+  while (rem >= 8 && shown < 4) {
+    uint32_t sz = rd32le(d + off), ty = rd32le(d + off + 4);
+    if (sz < 8 || (int)sz > rem)
+      break;
+    uint32_t p0 = sz >= 12 ? rd32le(d + off + 8) : 0;
+    uint32_t p1 = sz >= 16 ? rd32le(d + off + 12) : 0;
+    len += snprintf(msg + len, sizeof(msg) - (size_t)len, " [t=0x%x s=%u p0=0x%x p1=0x%x]", ty,
+                    sz, p0, p1);
+    off += (int)sz;
+    rem -= (int)sz;
+    shown++;
+    count++;
+  }
+  while (rem >= 8) {
+    uint32_t sz = rd32le(d + off);
+    if (sz < 8 || (int)sz > rem)
+      break;
+    off += (int)sz;
+    rem -= (int)sz;
+    count++;
+  }
+  if (count > shown)
+    snprintf(msg + len, sizeof(msg) - (size_t)len, " (+%d more)", count - shown);
+  phase(msg);
+  (void)s;
+}
+
 static int poll_events(m50_session *s, int timeout_ms)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  service_event(s);
   uint8_t *d = NULL;
   int dl = 0;
   int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, timeout_ms);
+  if (r >= 0 && s->ev_dump_left > 0 && dl > 8) {
+    s->ev_dump_left--;
+    log_event_records(s, d, dl);
+  }
   free(d);
   return r < 0 ? -1 : 0;
 }
@@ -645,7 +740,8 @@ static int op_ok(m50_session *s, const char *name, uint16_t op, const uint32_t *
   }
 }
 
-static int write_prop_retry(m50_session *s, uint32_t prop, uint32_t value, int vlen, int timeout_ms)
+static int write_prop_retry(m50_session *s, uint32_t prop, uint32_t value, int vlen, int timeout_ms,
+                            int max_attempts, int delay_ms)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
   uint8_t payload[12];
@@ -658,34 +754,43 @@ static int write_prop_retry(m50_session *s, uint32_t prop, uint32_t value, int v
   } else {
     wr32le(payload + 8, value);
   }
-  DWORD deadline = GetTickCount() + 5000;
-  for (;;) {
+  for (int attempt = 0; attempt < max_attempts; attempt++) {
     int code = host_data_command(s, EOS_SET_PROP_EX, payload, 12, NULL, 0, acc, 3, timeout_ms);
     if (code < 0)
       return -1;
     if (code == R_OK)
       return 0;
-    if (GetTickCount() >= deadline) {
-      set_err("timed out writing property 0x%x", prop);
-      return -1;
-    }
+    if (attempt + 1 >= max_attempts)
+      break;
     if (poll_events(s, timeout_ms) != 0)
       return -1;
-    msleep(10);
+    msleep(delay_ms);
   }
+  set_err("timed out writing property 0x%x", prop);
+  return -1;
+}
+
+/* Re-run the EVF tail of the bootstrap: approximates the P->Movie dial
+ * switch that was observed to always revive the feed. */
+int m50_restart_evf(m50_session *s, int out_value)
+{
+  if (write_prop_retry(s, PROP_EVF_OUT, 0, 4, 10000, 3, 100) != 0)
+    return -1;
+  if (poll_events(s, 10000) != 0)
+    return -1;
+  msleep(300);
+  /* Best effort: fresh Movie mode refuses this; the output select matters. */
+  write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000, 2, 250);
+  if (write_prop_retry(s, PROP_EVF_OUT, (uint32_t)out_value, 4, 10000, 50, 100) != 0)
+    return -1;
+  phase("EVF restarted");
+  return 0;
 }
 
 m50_session *m50_connect(const char *host, int port, const char *local_address, int init_timeout_ms)
 {
-  static int ws_init = 0;
-  if (!ws_init) {
-    WSADATA wd;
-    if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
-      set_err("WSAStartup failed");
-      return NULL;
-    }
-    ws_init = 1;
-  }
+  if (ensure_ws() != 0)
+    return NULL;
   m50_session *s = (m50_session *)calloc(1, sizeof(*s));
   if (!s) {
     set_err("out of memory");
@@ -694,19 +799,12 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   s->cmd = INVALID_SOCKET;
   s->evt = INVALID_SOCKET;
   s->txn = 1;
+  s->ev_dump_left = 6;
 
   static const uint16_t acc_ok[] = { R_OK };
-  static const uint16_t acc_all[] = { R_OK, R_BUSY, R_NOT_READY };
 
   s->cmd = dial(host, port, local_address, 10000);
   if (s->cmd == INVALID_SOCKET) {
-    free(s);
-    return NULL;
-  }
-  s->evt = dial(host, port, local_address, 10000);
-  if (s->evt == INVALID_SOCKET) {
-    set_err("event channel connect failed: %s", m50_last_error());
-    closesocket(s->cmd);
     free(s);
     return NULL;
   }
@@ -720,6 +818,12 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   s->session_id = conn;
   phase("init command ACKed");
 
+  /* PTP/IP order: event socket is dialed only after the Init ACK. */
+  s->evt = dial(host, port, local_address, 10000);
+  if (s->evt == INVALID_SOCKET) {
+    teardown(s);
+    return NULL;
+  }
   if (init_event(s->evt, conn, 10000) != 0) {
     teardown(s);
     return NULL;
@@ -771,7 +875,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
       teardown(s);
       return NULL;
     }
-    if (write_prop_retry(s, PROP_CAPACITY, 4, 4, 10000) != 0) {
+    if (write_prop_retry(s, PROP_CAPACITY, 4, 4, 10000, 500, 10) != 0) {
       teardown(s);
       return NULL;
     }
@@ -786,7 +890,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
       teardown(s);
       return NULL;
     }
-    if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000) != 0) {
+    if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000, 2, 250) != 0) {
       /* Fresh Movie mode refuses this write; the output select below is
        * what actually starts the feed. Non-fatal by hardware evidence. */
       phase("EVF mode write refused, continuing");
@@ -795,7 +899,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
     }
     /* M50/DIGIC-8 output modes: 0 none, 1 camera, 2 host, 3 cameraAndHost.
      * cameraAndHost keeps the LCD live while streaming to the PC. */
-    if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000) != 0) {
+    if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000, 500, 10) != 0) {
       teardown(s);
       return NULL;
     }
@@ -814,9 +918,15 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   return s;
 }
 
-static int extract_jpeg(const uint8_t *frame, int flen, uint8_t **out, int *out_len)
+/* Returns 1 with a validated JPEG, 2 for a well-formed blob with no JPEG,
+ * 0 for not-ready (no data), -1 malformed/fatal. */
+static int extract_jpeg(const uint8_t *frame, int flen, uint8_t **out, int *out_len,
+                        m50_session *s)
 {
   int off = 0;
+  int segs = 0;
+  char table[256];
+  int tlen = 0;
   while (off < flen) {
     if (flen - off < 8)
       break;
@@ -824,25 +934,60 @@ static int extract_jpeg(const uint8_t *frame, int flen, uint8_t **out, int *out_
     uint32_t type = rd32le(frame + off + 4);
     if (blen < 8 || off + (int)blen > flen)
       break;
+    if (segs < 8)
+      tlen += snprintf(table + tlen, sizeof(table) - (size_t)tlen, " [%u:%u]", type, blen);
+    segs++;
     if (type == 1 || type == 9 || type == 11) {
       const uint8_t *cand = frame + off + 8;
       int clen = (int)blen - 8;
-      if (clen >= 4 && cand[0] == 0xff && cand[1] == 0xd8 &&
-          cand[clen - 2] == 0xff && cand[clen - 1] == 0xd9) {
-        uint8_t *jpg = (uint8_t *)malloc((size_t)clen);
+      int has_soi = clen >= 4 && cand[0] == 0xff && cand[1] == 0xd8;
+      int has_eoi = 0;
+      int scan = clen - 16;
+      if (scan < 0)
+        scan = 0;
+      if (has_soi) {
+        for (int i = clen - 2; i >= scan; i--) {
+          if (cand[i] == 0xff && cand[i + 1] == 0xd9) {
+            has_eoi = 1;
+            break;
+          }
+        }
+      }
+      if (has_soi && has_eoi) {
+        /* Truncate at EOI: some bodies pad the segment tail. */
+        int use = clen;
+        for (int i = clen - 2; i >= scan; i--) {
+          if (cand[i] == 0xff && cand[i + 1] == 0xd9) {
+            use = i + 2;
+            break;
+          }
+        }
+        uint8_t *jpg = (uint8_t *)malloc((size_t)use);
         if (!jpg) {
           set_err("out of memory");
           return -1;
         }
-        memcpy(jpg, cand, (size_t)clen);
+        memcpy(jpg, cand, (size_t)use);
         *out = jpg;
-        *out_len = clen;
+        *out_len = use;
         return 1;
       }
     }
     off += (int)blen;
   }
-  return 0;
+  if (segs > 0 && !s->nojpeg_logged) {
+    s->nojpeg_logged = 1;
+    char msg[512];
+    int m = snprintf(msg, sizeof(msg), "OK but no JPEG (%d bytes,%d segs):", flen, segs);
+    m += snprintf(msg + m, sizeof(msg) - (size_t)m, "%s", table);
+    if (flen >= 32) {
+      m += snprintf(msg + m, sizeof(msg) - (size_t)m, " head=");
+      for (int i = 0; i < 32 && m < (int)sizeof(msg) - 4; i++)
+        m += snprintf(msg + m, sizeof(msg) - (size_t)m, "%02x", frame[i]);
+    }
+    phase(msg);
+  }
+  return segs > 0 ? 2 : 0;
 }
 
 int m50_keepalive(m50_session *s)
@@ -966,7 +1111,7 @@ int m50_raw_bootstrap_tol(void *vs, int minimal, int tolerant)
       printf("FAIL poll\n");
       return -1;
     }
-    if (write_prop_retry(s, PROP_CAPACITY, 4, 4, 10000) != 0) {
+    if (write_prop_retry(s, PROP_CAPACITY, 4, 4, 10000, 500, 10) != 0) {
       printf("FAIL d11c: %s\n", m50_last_error());
       return -1;
     }
@@ -980,7 +1125,7 @@ int m50_raw_bootstrap_tol(void *vs, int minimal, int tolerant)
       return -1;
     }
   }
-  if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000) != 0) {
+  if (write_prop_retry(s, PROP_EVF_MODE, 1, 2, 10000, 500, 10) != 0) {
     if (tolerant) {
       printf("warn evfmode: %s (continuing)\n", m50_last_error());
     } else {
@@ -990,7 +1135,7 @@ int m50_raw_bootstrap_tol(void *vs, int minimal, int tolerant)
   } else {
     printf("ok evfmode\n");
   }
-  if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000) != 0) {
+  if (write_prop_retry(s, PROP_EVF_OUT, 3, 4, 10000, 500, 10) != 0) {
     printf("FAIL evfout: %s\n", m50_last_error());
     return -1;
   }
@@ -1022,7 +1167,7 @@ int m50_raw_vf(void *vs, int p2, int p3, uint8_t **out_jpeg, int *out_len)
   }
   uint8_t *jpg = NULL;
   int jlen = 0;
-  int r = extract_jpeg(data, dlen, &jpg, &jlen);
+  int r = extract_jpeg(data, dlen, &jpg, &jlen, s);
   free(data);
   if (r <= 0)
     return 0;
@@ -1048,6 +1193,13 @@ int m50_raw_evf(void *vs, int value)
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  /* Continuous event pump (200ms): Canon expects it while streaming. */
+  DWORD now = GetTickCount();
+  if (now - s->last_ev_tick >= 200) {
+    s->last_ev_tick = now;
+    if (poll_events(s, 10000) != 0)
+      return -1;
+  }
   uint32_t params[3] = { 0x00200000, 1, 0 };
   uint8_t *data = NULL;
   int dlen = 0;
@@ -1059,21 +1211,16 @@ int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
   if (code == R_BUSY || code == R_NOT_READY) {
     free(data);
     s->transient_n++;
-    if (s->transient_n % 100 == 0) {
-      if (poll_events_logged(s, 10000, phase) != 0)
-        return -1;
-    } else if (poll_events(s, 10000) != 0) {
-      return -1;
-    }
+    msleep(100);
     return 0;
   }
   uint8_t *jpg = NULL;
   int jlen = 0;
-  int r = extract_jpeg(data, dlen, &jpg, &jlen);
+  int r = extract_jpeg(data, dlen, &jpg, &jlen, s);
   free(data);
   if (r < 0)
     return -1;
-  if (r == 0)
+  if (r != 1)
     return 0;
   *out_jpeg = jpg;
   *out_len = jlen;

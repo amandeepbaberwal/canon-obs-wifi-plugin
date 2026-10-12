@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -15,9 +16,9 @@ const char *m50_last_error(void);
 /*
  * Open command + event channels, run the MTP session, perform the Canon EOS
  * Live View bootstrap (SetRemoteMode, SetEventMode, SetCapacity, capacity
- * property, SetPcConnectMode, EVF mode, EVF output device 8). init_timeout_ms
- * covers the on-camera pairing prompt wait (camera holds the Init ACK open).
- * Returns NULL on failure (see m50_last_error).
+ * property, SetPcConnectMode, EVF mode, EVF output device 3=cameraAndHost).
+ * init_timeout_ms covers the on-camera pairing prompt wait (camera holds the
+ * Init ACK open). Returns NULL on failure (see m50_last_error).
  */
 m50_session *m50_connect(const char *host, int port, const char *local_address,
                          int init_timeout_ms);
@@ -28,6 +29,10 @@ m50_session *m50_connect(const char *host, int port, const char *local_address,
  * transient not-ready (call again), -1 on fatal error.
  */
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len);
+
+/* Re-run the EVF tail of the bootstrap (0 -> pause -> mode -> out_value).
+ * Approximates the dial switch that revives a stalled feed. */
+int m50_restart_evf(m50_session *s, int out_value);
 
 /* Best-effort GetEvent keepalive; keeps the camera from idling to sleep.
  * Returns 0 on any answered poll, -1 on transport failure. */
@@ -49,6 +54,9 @@ void m50_raw_close(void *sess);
 
 /* Optional phase logger (e.g. OBS log). */
 void m50_set_log(void (*cb)(const char *));
+
+/* Worker sets its cancel flag so blocking waits abort promptly on stop. */
+void m50_set_cancel(volatile bool *flag);
 
 #define M50_MAX_CAMERAS 16
 
