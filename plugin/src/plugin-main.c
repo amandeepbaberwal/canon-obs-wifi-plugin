@@ -201,7 +201,7 @@ static void *capture_thread(void *arg)
       snprintf(msg, sizeof(msg), "Connect failed: %.220s", m50_last_error());
       set_status(ctx, msg);
       blog(LOG_WARNING, "[m50] %s", msg);
-      for (int i = 0; i < 100 && ctx->running && !ctx->retry_now; i++)
+      for (int i = 0; i < 30 && ctx->running && !ctx->retry_now; i++)
         os_sleep_ms(100);
       continue;
     }
