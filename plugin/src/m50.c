@@ -85,6 +85,7 @@ struct m50_session {
   SOCKET evt;
   uint32_t txn;
   uint32_t session_id;
+  int transient_n;
 };
 
 static uint32_t rd32le(const uint8_t *p)
@@ -586,12 +587,8 @@ static int close_session(m50_session *s, int timeout_ms)
 
 static void teardown(m50_session *s)
 {
-  if (!s)
-    return;
-  /* Best effort: release the camera-side session so rapid reconnects
-   * do not pile up half-open sessions that wedge the camera. */
-  if (s->cmd != INVALID_SOCKET)
-    close_session(s, 2000);
+  /* Just close the sockets. An explicit CloseSession makes the M50 show
+   * Err 12 and refuse follow-up sessions until dismissed. */
   m50_close(s);
 }
 
@@ -601,6 +598,25 @@ static int poll_events(m50_session *s, int timeout_ms)
   uint8_t *d = NULL;
   int dl = 0;
   int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, timeout_ms);
+  free(d);
+  return r < 0 ? -1 : 0;
+}
+
+/* Poll events and report payload size + first bytes (diagnoses stalls). */
+static int poll_events_logged(m50_session *s, int timeout_ms, void (*logfn)(const char *))
+{
+  static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  uint8_t *d = NULL;
+  int dl = 0;
+  int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, timeout_ms);
+  if (r >= 0 && logfn && dl > 8) {
+    char msg[160];
+    int n = dl < 40 ? dl : 40;
+    int off = snprintf(msg, sizeof(msg), "event %d bytes: ", dl);
+    for (int i = 0; i < n && off < (int)sizeof(msg) - 4; i++)
+      off += snprintf(msg + off, sizeof(msg) - (size_t)off, "%02x", d[i]);
+    logfn(msg);
+  }
   free(d);
   return r < 0 ? -1 : 0;
 }
@@ -1024,8 +1040,13 @@ int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
   }
   if (code == R_BUSY || code == R_NOT_READY) {
     free(data);
-    if (poll_events(s, 10000) != 0)
+    s->transient_n++;
+    if (s->transient_n % 100 == 0) {
+      if (poll_events_logged(s, 10000, phase) != 0)
+        return -1;
+    } else if (poll_events(s, 10000) != 0) {
       return -1;
+    }
     return 0;
   }
   uint8_t *jpg = NULL;
@@ -1054,10 +1075,7 @@ void m50_close(m50_session *s)
 
 void m50_disconnect(m50_session *s)
 {
-  if (!s)
-    return;
-  if (s->cmd != INVALID_SOCKET)
-    close_session(s, 2000);
+  /* See teardown(): never send CloseSession, just close. */
   m50_close(s);
 }
 
