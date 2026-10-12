@@ -28,6 +28,7 @@
 #define DIR_HOST_TO_CAM 2u
 
 #define MTP_OPEN_SESSION 0x1002u
+#define MTP_CLOSE_SESSION 0x1003u
 #define MTP_GET_DEVICE_INFO 0x1001u
 
 #define EOS_SET_REMOTE_MODE 0x9114u
@@ -116,6 +117,7 @@ struct m50_session {
   DWORD last_ev_tick;
   int ev_dump_left;
   int nojpeg_logged;
+  int broken;
 };
 
 static uint32_t rd32le(const uint8_t *p)
@@ -544,7 +546,6 @@ static int cam_command_inner(m50_session *s, SOCKET sock, uint16_t op, const uin
   }
   *data = buf ? buf : (uint8_t *)malloc(1);
   *dlen = (int)total;
-  g_in_txn--;
   return code;
 }
 
@@ -552,6 +553,7 @@ static int cam_command_inner(m50_session *s, SOCKET sock, uint16_t op, const uin
 static int cam_command(m50_session *s, SOCKET sock, uint16_t op, const uint32_t *params, int nparams,
                        const uint16_t *accept, int naccept, uint8_t **data, int *dlen, int timeout_ms)
 {
+  g_in_txn++;
   int r = cam_command_inner(s, sock, op, params, nparams, accept, naccept, data, dlen, timeout_ms);
   g_in_txn--;
   return r;
@@ -648,29 +650,42 @@ static void msleep(int ms)
 
 static void teardown(m50_session *s)
 {
-  /* Just close the sockets. An explicit CloseSession makes the M50 show
-   * Err 12 and refuse follow-up sessions until dismissed. */
+  /* A failed, partial connection is not safe to shut down with more MTP
+   * commands. Healthy sessions use m50_disconnect() for graceful teardown. */
   m50_close(s);
 }
 
 /* Service the event socket: drain packets, answer probes, notice closes. */
 static int service_event(m50_session *s)
 {
-  if (s->evt == INVALID_SOCKET)
-    return 0;
+  if (s->broken)
+    return -1;
+  if (s->evt == INVALID_SOCKET) {
+    set_err("event channel is not connected");
+    s->broken = 1;
+    return -1;
+  }
   fd_set fds;
   FD_ZERO(&fds);
   FD_SET(s->evt, &fds);
   struct timeval tv = { 0, 0 };
-  if (select(0, &fds, NULL, NULL, &tv) <= 0)
+  int ready = select(0, &fds, NULL, NULL, &tv);
+  if (ready == 0)
     return 0;
+  if (ready < 0) {
+    set_err("event select failed: %d", WSAGetLastError());
+    s->broken = 1;
+    return -1;
+  }
   int len = 0;
   uint8_t *p = read_payload(s->evt, &len, 2000);
   if (!p) {
     phase("event channel closed by camera");
     closesocket(s->evt);
     s->evt = INVALID_SOCKET;
-    return 0;
+    s->broken = 1;
+    set_err("event channel closed by camera");
+    return -1;
   }
   if (len >= 4 && rd32le(p) == 13) {
     uint8_t pong[8];
@@ -722,7 +737,8 @@ static void log_event_records(m50_session *s, const uint8_t *d, int dl)
 static int poll_events(m50_session *s, int timeout_ms)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
-  service_event(s);
+  if (service_event(s) != 0)
+    return -1;
   uint8_t *d = NULL;
   int dl = 0;
   int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, timeout_ms);
@@ -731,6 +747,8 @@ static int poll_events(m50_session *s, int timeout_ms)
     log_event_records(s, d, dl);
   }
   free(d);
+  if (r < 0)
+    s->broken = 1;
   return r < 0 ? -1 : 0;
 }
 
@@ -1035,10 +1053,14 @@ static int extract_jpeg(const uint8_t *frame, int flen, uint8_t **out, int *out_
 int m50_keepalive(m50_session *s)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  if (service_event(s) != 0)
+    return -1;
   uint8_t *d = NULL;
   int dl = 0;
   int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, 10000);
   free(d);
+  if (r < 0)
+    s->broken = 1;
   return r < 0 ? -1 : 0;
 }
 
@@ -1201,6 +1223,7 @@ int m50_raw_vf(void *vs, int p2, int p3, uint8_t **out_jpeg, int *out_len)
   int code = cam_command(s, s->cmd, EOS_GET_VF_DATA, params, 3, acc, 3, &data, &dlen, 10000);
   if (code < 0) {
     free(data);
+    s->broken = 1;
     return -1;
   }
   if (code == R_BUSY || code == R_NOT_READY) {
@@ -1261,8 +1284,10 @@ int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
   int jlen = 0;
   int r = extract_jpeg(data, dlen, &jpg, &jlen, s);
   free(data);
-  if (r < 0)
+  if (r < 0) {
+    s->broken = 1;
     return -1;
+  }
   if (r != 1)
     return 0;
   *out_jpeg = jpg;
@@ -1283,7 +1308,49 @@ void m50_close(m50_session *s)
 
 void m50_disconnect(m50_session *s)
 {
-  /* See teardown(): never send CloseSession, just close. */
+  if (!s)
+    return;
+
+  /* Close a healthy EOS session cleanly. On a lost event/command channel,
+   * don't send more PTP traffic; just release the dead sockets. */
+  if (!s->broken && s->cmd != INVALID_SOCKET) {
+    static const uint16_t acc_ok[] = { R_OK };
+    uint8_t *d = NULL;
+    int dl = 0;
+    uint32_t zero = 0;
+
+    /* Stop the EVF output and remote/event modes before closing MTP. These
+     * are teardown operations; the verified startup/bootstrap bytes stay
+     * unchanged. */
+    if (write_prop_retry(s, PROP_EVF_OUT, 0, 4, 1500, 3, 100) != 0) {
+      s->broken = 1;
+      phase("EVF shutdown failed; closing sockets");
+    }
+    if (!s->broken) {
+      if (op_ok(s, "SetEventMode(0)", EOS_SET_EVENT_MODE, &zero, 1, 1500) != 0) {
+        s->broken = 1;
+        phase("SetEventMode(0) failed; closing sockets");
+      }
+    }
+    if (!s->broken) {
+      if (op_ok(s, "SetRemoteMode(0)", EOS_SET_REMOTE_MODE, &zero, 1, 1500) != 0) {
+        s->broken = 1;
+        phase("SetRemoteMode(0) failed; closing sockets");
+      }
+    }
+    if (!s->broken) {
+      if (cam_command(s, s->cmd, MTP_CLOSE_SESSION, NULL, 0,
+                      acc_ok, 1, &d, &dl, 1500) == R_OK) {
+        free(d);
+        d = NULL;
+        phase("MTP session closed cleanly");
+      } else {
+        free(d);
+        d = NULL;
+        phase("CloseSession failed; closing sockets");
+      }
+    }
+  }
   m50_close(s);
 }
 

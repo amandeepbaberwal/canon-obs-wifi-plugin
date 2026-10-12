@@ -139,7 +139,7 @@ static void *capture_thread(void *arg)
       blog(LOG_WARNING, "[m50] camera in WFT mode; need smartphone mode");
   }
 
-  int fails = 0, dial_tmo = 0;
+  int fails = 0;
   while (ctx->running && !ctx->cancelled) {
     /* Adopt a newly searched IP and honor manual pair requests. */
     pthread_mutex_lock(&ctx->lock);
@@ -207,30 +207,19 @@ static void *capture_thread(void *arg)
         wait_retry(ctx, 15000);
       } else if (strstr(err, "timed out") != NULL || strstr(err, "ETIMEDOUT") != NULL ||
                  strstr(err, "refused") != NULL || strstr(err, "ECONNREFUSED") != NULL) {
-        if (++dial_tmo >= 3) {
-          set_status(ctx, "Camera not listening. Dismiss any error on the camera, re-enter "
-                          "Wi-Fi > Connect to smartphone (waiting screen), then press Pair.");
-          blog(LOG_WARNING, "[m50] dial failing; auto-retry paused until Pair");
-          while (ctx->running && !ctx->cancelled && !ctx->retry_now)
-            os_sleep_ms(500);
-          pthread_mutex_lock(&ctx->lock);
-          ctx->retry_now = false;
-          pthread_mutex_unlock(&ctx->lock);
-          dial_tmo = 0;
-        } else {
-          int waits[] = { 3000, 6000, 12000, 24000, 30000 };
-          int w = waits[fails - 1 < 5 ? fails - 1 : 4];
-          if (w > 30000)
-            w = 30000;
-          wait_retry(ctx, w);
-        }
+        /* Keep trying while the camera boots or rejoins Wi-Fi. A previous
+         * three-timeout pause stranded the source until someone clicked Pair,
+         * so power-cycling the camera could never recover by itself. */
+        int waits[] = { 3000, 6000, 12000, 24000, 30000 };
+        int w = waits[fails - 1 < 5 ? fails - 1 : 4];
+        set_status(ctx, "Camera not listening; retrying automatically.");
+        wait_retry(ctx, w);
       } else {
         wait_retry(ctx, 3000);
       }
       continue;
     }
     fails = 0;
-    dial_tmo = 0;
     set_status(ctx, "Streaming.");
     blog(LOG_INFO, "[m50] connected, EVF bootstrap done; waiting for first frame");
 
@@ -238,7 +227,15 @@ static void *capture_thread(void *arg)
     long total_frames = 0;
     int wic_fails = 0;
     DWORD last_frame_ms = GetTickCount();
+    DWORD last_keepalive_ms = last_frame_ms;
     while (ctx->running && !ctx->cancelled) {
+      pthread_mutex_lock(&ctx->lock);
+      bool pair_requested = ctx->retry_now;
+      pthread_mutex_unlock(&ctx->lock);
+      if (pair_requested) {
+        blog(LOG_INFO, "[m50] ending current session for manual reconnect");
+        break;
+      }
       uint8_t *jpeg = NULL;
       int jlen = 0;
       int r = m50_get_frame(s, &jpeg, &jlen);
@@ -255,12 +252,18 @@ static void *capture_thread(void *arg)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x100 (camera may need a moment)");
         else if (transient_run > 100 && transient_run % 600 == 0)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x%d", transient_run);
+        DWORD now = GetTickCount();
+        if (now - last_frame_ms >= 20000) {
+          set_status(ctx, "No Live View frames for 20 seconds; restarting the camera session.");
+          blog(LOG_WARNING, "[m50] no Live View frame for 20s; recycling PTP session");
+          break;
+        }
         /* NOTE: no EVF restart here. An EVF-output rewrite mid-stall was
          * observed to kill the session ~1s later; passive waiting keeps
          * the session alive for the camera to start the feed itself. */
         /* Idle watchdog only: never interrupt steady streaming. */
-        if (GetTickCount() - last_frame_ms > 5000) {
-          last_frame_ms = GetTickCount();
+        if (now - last_keepalive_ms > 5000) {
+          last_keepalive_ms = now;
           if (m50_keepalive(s) != 0)
             blog(LOG_WARNING, "[m50] keepalive poll failed");
         }
@@ -269,6 +272,7 @@ static void *capture_thread(void *arg)
       }
       transient_run = 0;
       last_frame_ms = GetTickCount();
+      last_keepalive_ms = last_frame_ms;
       uint8_t *bgra = NULL;
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
