@@ -189,7 +189,7 @@ static void *capture_thread(void *arg)
     int transient_run = 0;
     long total_frames = 0;
     int wic_fails = 0;
-    DWORD last_keepalive = GetTickCount();
+    DWORD last_frame_ms = GetTickCount();
     while (ctx->running) {
       uint8_t *jpeg = NULL;
       int jlen = 0;
@@ -207,16 +207,17 @@ static void *capture_thread(void *arg)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x100 (camera may need a moment)");
         else if (transient_run > 100 && transient_run % 600 == 0)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x%d", transient_run);
+        /* Idle watchdog only: never interrupt steady streaming. */
+        if (GetTickCount() - last_frame_ms > 5000) {
+          last_frame_ms = GetTickCount();
+          if (m50_keepalive(s) != 0)
+            blog(LOG_WARNING, "[m50] keepalive poll failed");
+        }
         os_sleep_ms(50);
         continue;
       }
       transient_run = 0;
-      /* Keepalive so the camera never idles to sleep mid-stream. */
-      if (GetTickCount() - last_keepalive > 3000) {
-        last_keepalive = GetTickCount();
-        if (m50_keepalive(s) != 0)
-          blog(LOG_WARNING, "[m50] keepalive poll failed");
-      }
+      last_frame_ms = GetTickCount();
       uint8_t *bgra = NULL;
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
