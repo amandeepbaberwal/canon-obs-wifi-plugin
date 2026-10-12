@@ -237,9 +237,7 @@ static void *capture_thread(void *arg)
     int transient_run = 0;
     long total_frames = 0;
     int wic_fails = 0;
-    int ev_stage = 0;
-    DWORD birth_ms = GetTickCount();
-    DWORD last_frame_ms = birth_ms;
+    DWORD last_frame_ms = GetTickCount();
     while (ctx->running && !ctx->cancelled) {
       uint8_t *jpeg = NULL;
       int jlen = 0;
@@ -257,25 +255,9 @@ static void *capture_thread(void *arg)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x100 (camera may need a moment)");
         else if (transient_run > 100 && transient_run % 600 == 0)
           blog(LOG_WARNING, "[m50] viewfinder not-ready x%d", transient_run);
-        /* Escalate only while no frame has ever arrived on this session. */
-        if (total_frames == 0) {
-          DWORD el = GetTickCount() - birth_ms;
-          if (el > 3000 && ev_stage == 0) {
-            ev_stage = 1;
-            blog(LOG_INFO, "[m50] no frames yet; restarting EVF (3)");
-            if (m50_restart_evf(s, 3) != 0)
-              blog(LOG_WARNING, "[m50] EVF restart failed: %s", m50_last_error());
-          } else if (el > 8000 && ev_stage == 1) {
-            ev_stage = 2;
-            blog(LOG_INFO, "[m50] no frames yet; restarting EVF (2)");
-            if (m50_restart_evf(s, 2) != 0)
-              blog(LOG_WARNING, "[m50] EVF restart failed: %s", m50_last_error());
-          } else if (el > 15000) {
-            set_status(ctx, "No frames from camera; reconnecting.");
-            blog(LOG_WARNING, "[m50] no frames in 15s; reconnecting");
-            break;
-          }
-        }
+        /* NOTE: no EVF restart here. An EVF-output rewrite mid-stall was
+         * observed to kill the session ~1s later; passive waiting keeps
+         * the session alive for the camera to start the feed itself. */
         /* Idle watchdog only: never interrupt steady streaming. */
         if (GetTickCount() - last_frame_ms > 5000) {
           last_frame_ms = GetTickCount();
