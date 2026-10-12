@@ -221,9 +221,34 @@ static void *capture_thread(void *arg)
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
         store_frame(ctx, bgra, w, h, stride);
-        if (++total_frames == 1)
+        if (++total_frames == 1) {
           blog(LOG_INFO, "[m50] first frame: %dx%d (%d bytes jpeg)", w, h, jlen);
-        else if (total_frames % 1200 == 0)
+          /* Debug dump: %TEMP%\m50_firstframe.bmp for visual verification. */
+          HANDLE f = CreateFileA("C:\\Windows\\Temp\\m50_firstframe.bmp", GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+          if (f != INVALID_HANDLE_VALUE) {
+            BITMAPFILEHEADER fh;
+            BITMAPINFOHEADER ih;
+            memset(&fh, 0, sizeof(fh));
+            memset(&ih, 0, sizeof(ih));
+            DWORD row = (DWORD)stride * (DWORD)h;
+            fh.bfType = 0x4D42;
+            fh.bfOffBits = sizeof(fh) + sizeof(ih);
+            fh.bfSize = fh.bfOffBits + row;
+            ih.biSize = sizeof(ih);
+            ih.biWidth = w;
+            ih.biHeight = -h;
+            ih.biPlanes = 1;
+            ih.biBitCount = 32;
+            ih.biCompression = BI_RGB;
+            DWORD wr = 0;
+            WriteFile(f, &fh, sizeof(fh), &wr, NULL);
+            WriteFile(f, &ih, sizeof(ih), &wr, NULL);
+            WriteFile(f, bgra, row, &wr, NULL);
+            CloseHandle(f);
+            blog(LOG_INFO, "[m50] wrote C:\\Windows\\Temp\\m50_firstframe.bmp");
+          }
+        } else if (total_frames % 1200 == 0)
           blog(LOG_INFO, "[m50] %ld frames", total_frames);
       } else if (++wic_fails <= 3) {
         blog(LOG_WARNING, "[m50] JPEG decode failed (%d bytes)", jlen);
@@ -399,7 +424,7 @@ static void m50_get_defaults(obs_data_t *settings)
 static struct obs_source_info m50_source_info = {
   .id = "m50_wifi_source",
   .type = OBS_SOURCE_TYPE_INPUT,
-  .output_flags = OBS_SOURCE_VIDEO,
+  .output_flags = OBS_SOURCE_ASYNC_VIDEO,
   .get_name = m50_get_name,
   .create = m50_create,
   .destroy = m50_destroy,
