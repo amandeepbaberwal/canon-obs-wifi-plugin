@@ -556,6 +556,11 @@ static int cam_command(m50_session *s, SOCKET sock, uint16_t op, const uint32_t 
   g_in_txn++;
   int r = cam_command_inner(s, sock, op, params, nparams, accept, naccept, data, dlen, timeout_ms);
   g_in_txn--;
+  if (r < 0) {
+    char detail[sizeof(g_err)];
+    snprintf(detail, sizeof(detail), "%s", g_err);
+    set_err("MTP op 0x%04x failed: %.470s", op, detail);
+  }
   return r;
 }
 
@@ -640,6 +645,11 @@ static int host_data_command(m50_session *s, uint16_t op, const uint8_t *bytes, 
   g_in_txn++;
   int r = host_data_command_inner(s, op, bytes, blen, params, nparams, accept, naccept, timeout_ms);
   g_in_txn--;
+  if (r < 0) {
+    char detail[sizeof(g_err)];
+    snprintf(detail, sizeof(detail), "%s", g_err);
+    set_err("MTP data op 0x%04x failed: %.460s", op, detail);
+  }
   return r;
 }
 
@@ -964,15 +974,19 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
       return NULL;
     }
     phase("EVF output set");
+    phase("post-EVF GetEvent poll started");
     if (poll_events(s, 10000) != 0) {
+      phase("post-EVF GetEvent poll failed");
       teardown(s);
       return NULL;
     }
+    phase("post-EVF GetEvent poll completed");
   }
 
   /* One full event dump: right after bootstrap the camera reports its
    * complete property state (aperture/shutter/ISO/focus...). */
-  poll_events_logged(s, 10000, phase);
+  if (poll_events_logged(s, 10000, phase) != 0)
+    phase("diagnostic GetEvent poll failed after bootstrap");
 
   msleep(150);
   return s;
