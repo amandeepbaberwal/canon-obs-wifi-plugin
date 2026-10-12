@@ -60,6 +60,15 @@ static void (*g_log)(const char *) = NULL;
 /* Set by the owning worker thread; wait_sock aborts promptly when set. */
 static __declspec(thread) volatile bool *g_cancel = NULL;
 
+/* Where the last connect attempt died: 0=dial, 1=init, 2=event/session,
+ * 3=bootstrap. Lets the worker retry dial-stage misses fast. */
+static __declspec(thread) int g_stage = 0;
+
+int m50_last_stage(void)
+{
+  return g_stage;
+}
+
 /* True while a request/response transaction is in flight; cancel waits. */
 static __declspec(thread) int g_in_txn = 0;
 
@@ -749,7 +758,7 @@ static int op_ok(m50_session *s, const char *name, uint16_t op, const uint32_t *
                  int timeout_ms)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
-  DWORD deadline = GetTickCount() + 8000;
+  DWORD deadline = GetTickCount() + 3000;
   for (;;) {
     uint8_t *d = NULL;
     int dl = 0;
@@ -819,6 +828,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
 {
   if (ensure_ws() != 0)
     return NULL;
+  g_stage = 0;
   m50_session *s = (m50_session *)calloc(1, sizeof(*s));
   if (!s) {
     set_err("out of memory");
@@ -831,13 +841,14 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
 
   static const uint16_t acc_ok[] = { R_OK };
 
-  s->cmd = dial(host, port, local_address, 10000);
+  s->cmd = dial(host, port, local_address, 3000);
   if (s->cmd == INVALID_SOCKET) {
     free(s);
     return NULL;
   }
 
   uint32_t conn = 0;
+  g_stage = 1;
   phase("init command sent, waiting for ACK (accept prompt)");
   if (init_command(s->cmd, &conn, init_timeout_ms) != 0) {
     teardown(s);
@@ -847,7 +858,8 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   phase("init command ACKed");
 
   /* PTP/IP order: event socket is dialed only after the Init ACK. */
-  s->evt = dial(host, port, local_address, 10000);
+  g_stage = 2;
+  s->evt = dial(host, port, local_address, 3000);
   if (s->evt == INVALID_SOCKET) {
     teardown(s);
     return NULL;
@@ -884,6 +896,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   phase("MTP session open, device info read");
 
   /* Canon Live View bootstrap (T100-verified, M50-verified 2026-10-12) */
+  g_stage = 3;
   {
     uint32_t p1 = 1;
     if (op_ok(s, "SetRemoteMode", EOS_SET_REMOTE_MODE, &p1, 1, 10000) != 0) {
@@ -943,7 +956,7 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
    * complete property state (aperture/shutter/ISO/focus...). */
   poll_events_logged(s, 10000, phase);
 
-  msleep(1000);
+  msleep(150);
   return s;
 }
 

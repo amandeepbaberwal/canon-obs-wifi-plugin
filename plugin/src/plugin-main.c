@@ -199,7 +199,11 @@ static void *capture_thread(void *arg)
       set_status(ctx, msg);
       blog(LOG_WARNING, "[m50] %s", msg);
       fails++;
-      if (strstr(err, "ECONNRESET") != NULL || strstr(err, "10054") != NULL) {
+      if (m50_last_stage() == 0) {
+        /* Camera not listening yet (off / joining): cheap fast polls so we
+         * land inside its 3-4s previous-connection window when it opens. */
+        wait_retry(ctx, 2000);
+      } else if (strstr(err, "ECONNRESET") != NULL || strstr(err, "10054") != NULL) {
         wait_retry(ctx, 15000);
       } else if (strstr(err, "timed out") != NULL || strstr(err, "ETIMEDOUT") != NULL ||
                  strstr(err, "refused") != NULL || strstr(err, "ECONNREFUSED") != NULL) {

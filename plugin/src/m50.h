@@ -58,6 +58,9 @@ void m50_set_log(void (*cb)(const char *));
 /* Worker sets its cancel flag so blocking waits abort promptly on stop. */
 void m50_set_cancel(volatile bool *flag);
 
+/* Where the last connect attempt died (see g_stage). */
+int m50_last_stage(void);
+
 #define M50_MAX_CAMERAS 16
 
 typedef struct m50_found {
