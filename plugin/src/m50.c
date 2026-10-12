@@ -60,6 +60,9 @@ static void (*g_log)(const char *) = NULL;
 /* Set by the owning worker thread; wait_sock aborts promptly when set. */
 static __declspec(thread) volatile bool *g_cancel = NULL;
 
+/* True while a request/response transaction is in flight; cancel waits. */
+static __declspec(thread) int g_in_txn = 0;
+
 static int ensure_ws(void);
 
 void m50_set_log(void (*cb)(const char *))
@@ -123,7 +126,7 @@ static int wait_sock(SOCKET s, int want_read, int timeout_ms)
 {
   int waited = 0;
   while (waited < timeout_ms) {
-    if (g_cancel && *g_cancel) {
+    if (!g_in_txn && g_cancel && *g_cancel) {
       set_err("cancelled");
       return -1;
     }
@@ -382,8 +385,9 @@ static int accepted(uint16_t code, const uint16_t *list, int n)
 }
 
 /* Camera-to-host command. Returns response code, sets *data (malloc'd, maybe empty). */
-static int cam_command(m50_session *s, SOCKET sock, uint16_t op, const uint32_t *params, int nparams,
-                       const uint16_t *accept, int naccept, uint8_t **data, int *dlen, int timeout_ms)
+static int cam_command_inner(m50_session *s, SOCKET sock, uint16_t op, const uint32_t *params, int nparams,
+                             const uint16_t *accept, int naccept, uint8_t **data, int *dlen,
+                             int timeout_ms)
 {
   uint32_t txn = s->txn++;
   size_t plen = 14 + (size_t)nparams * 4;
@@ -531,13 +535,27 @@ static int cam_command(m50_session *s, SOCKET sock, uint16_t op, const uint32_t 
   }
   *data = buf ? buf : (uint8_t *)malloc(1);
   *dlen = (int)total;
+  g_in_txn--;
   return code;
 }
 
+/* In-flight transactions always run to completion; cancel applies between. */
+static int cam_command(m50_session *s, SOCKET sock, uint16_t op, const uint32_t *params, int nparams,
+                       const uint16_t *accept, int naccept, uint8_t **data, int *dlen, int timeout_ms)
+{
+  int r = cam_command_inner(s, sock, op, params, nparams, accept, naccept, data, dlen, timeout_ms);
+  g_in_txn--;
+  return r;
+}
+
+static int host_data_command_inner(m50_session *s, uint16_t op, const uint8_t *bytes, int blen,
+                                   const uint32_t *params, int nparams, const uint16_t *accept,
+                                   int naccept, int timeout_ms);
+
 /* Host-to-camera data command (property writes). Returns response code. */
-static int host_data_command(m50_session *s, uint16_t op, const uint8_t *bytes, int blen,
-                             const uint32_t *params, int nparams,
-                             const uint16_t *accept, int naccept, int timeout_ms)
+static int host_data_command_inner(m50_session *s, uint16_t op, const uint8_t *bytes, int blen,
+                                   const uint32_t *params, int nparams, const uint16_t *accept,
+                                   int naccept, int timeout_ms)
 {
   uint32_t txn = s->txn++;
   size_t plen = 14 + (size_t)nparams * 4;
@@ -602,6 +620,16 @@ static int host_data_command(m50_session *s, uint16_t op, const uint8_t *bytes, 
     return -1;
   }
   return code;
+}
+
+static int host_data_command(m50_session *s, uint16_t op, const uint8_t *bytes, int blen,
+                             const uint32_t *params, int nparams, const uint16_t *accept,
+                             int naccept, int timeout_ms)
+{
+  g_in_txn++;
+  int r = host_data_command_inner(s, op, bytes, blen, params, nparams, accept, naccept, timeout_ms);
+  g_in_txn--;
+  return r;
 }
 
 static void msleep(int ms)
@@ -830,12 +858,13 @@ m50_session *m50_connect(const char *host, int port, const char *local_address, 
   }
   phase("event channel ACKed");
 
-  /* MTP session */
+  /* MTP session (0x201E = already open after an unclean exit: continue). */
   {
+    static const uint16_t acc_open[] = { R_OK, 0x201E };
     uint32_t p = conn;
     uint8_t *d = NULL;
     int dl = 0;
-    if (cam_command(s, s->cmd, MTP_OPEN_SESSION, &p, 1, acc_ok, 1, &d, &dl, 10000) < 0) {
+    if (cam_command(s, s->cmd, MTP_OPEN_SESSION, &p, 1, acc_open, 2, &d, &dl, 10000) < 0) {
       free(d);
       teardown(s);
       return NULL;
@@ -1042,9 +1071,10 @@ int m50_raw_connect(const char *host, int port, const char *local_address, int i
     return -1;
   }
   {
+    static const uint16_t acc_open[] = { R_OK, 0x201E };
     uint8_t *d = NULL;
     int dl = 0;
-    if (cam_command(s, s->cmd, MTP_OPEN_SESSION, &conn, 1, acc_ok, 1, &d, &dl, 10000) < 0) {
+    if (cam_command(s, s->cmd, MTP_OPEN_SESSION, &conn, 1, acc_open, 2, &d, &dl, 10000) < 0) {
       free(d);
       teardown(s);
       return -1;
@@ -1540,42 +1570,14 @@ int m50_pick_local(const char *camera_ip, char *out, int out_len)
       if (!first[0]) {
         snprintf(first, sizeof(first), "%s", ip);
       }
-      if (camera_ip && camera_ip[0]) {
-        /* same /24 heuristic for a router LAN */
-        const char *c1 = camera_ip, *c2 = ip;
-        int dots = 0;
-        size_t i = 0, j = 0, match = 0;
-        while (c1[i] && c2[j] && dots < 3) {
-          if (c1[i] != c2[j])
-            break;
-          if (c1[i] == '.')
-            dots++;
-          i++;
-          j++;
-        }
-        if (dots == 3) {
-          /* verify the /24 octets match fully (avoid 192.168.1 vs 192.168.10) */
-          char n1[64], n2[64];
-          snprintf(n1, sizeof(n1), "%s", camera_ip);
-          snprintf(n2, sizeof(n2), "%s", ip);
-          char *p1 = n1, *p2 = n2;
-          match = 1;
-          for (int k = 0; k < 3; k++) {
-            char *d1 = strchr(p1, '.'), *d2 = strchr(p2, '.');
-            if (!d1 || !d2) {
-              match = 0;
-              break;
-            }
-            *d1 = '\0';
-            *d2 = '\0';
-            if (strcmp(p1, p2) != 0) {
-              match = 0;
-              break;
-            }
-            p1 = d1 + 1;
-            p2 = d2 + 1;
-          }
-          if (match && !same24[0])
+      if (camera_ip && camera_ip[0] && u->OnLinkPrefixLength > 0 && u->OnLinkPrefixLength <= 32) {
+        struct in_addr cam;
+        if (inet_pton(AF_INET, camera_ip, &cam) == 1) {
+          uint32_t bits = u->OnLinkPrefixLength;
+          uint32_t mask = bits >= 32 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - bits));
+          uint32_t a = ntohl(sin->sin_addr.s_addr);
+          uint32_t b = ntohl(cam.s_addr);
+          if ((a & mask) == (b & mask) && !same24[0])
             snprintf(same24, sizeof(same24), "%s", ip);
         }
       }

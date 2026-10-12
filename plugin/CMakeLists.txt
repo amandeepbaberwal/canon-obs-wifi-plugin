@@ -3,8 +3,8 @@ project(obs-m50-source C)
 
 set(CMAKE_C_STANDARD 11)
 
-set(OBS_STUDIO_DIR "C:/Users/aman/obs-studio")
-set(OBS_BUILD_DIR "C:/Users/aman/obs-build")
+set(OBS_STUDIO_DIR "C:/Users/aman/obs-studio" CACHE PATH "obs-studio source dir (matching your OBS version tag)")
+set(OBS_BUILD_DIR "C:/Users/aman/obs-build" CACHE PATH "obs-studio build dir containing libobs/Release/obs.lib")
 
 add_library(obs-m50-source MODULE
   src/plugin-main.c
