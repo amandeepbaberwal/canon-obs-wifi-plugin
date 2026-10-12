@@ -29,6 +29,10 @@ m50_session *m50_connect(const char *host, int port, const char *local_address,
  */
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len);
 
+/* Best-effort GetEvent keepalive; keeps the camera from idling to sleep.
+ * Returns 0 on any answered poll, -1 on transport failure. */
+int m50_keepalive(m50_session *s);
+
 void m50_close(m50_session *s);
 
 /* Best-effort CloseSession before closing sockets. */

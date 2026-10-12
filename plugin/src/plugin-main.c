@@ -30,8 +30,14 @@ struct m50_ctx {
   char pending_ip[64];
   m50_found cams[M50_MAX_CAMERAS];
   int ncams;
+  /* Latest decoded frame for synchronous output on the video thread. */
   uint8_t *frame_buf;
   size_t frame_cap;
+  int frame_w;
+  int frame_h;
+  int frame_stride;
+  unsigned long frame_seq;
+  unsigned long frame_shown;
 };
 
 static void set_status(struct m50_ctx *ctx, const char *text)
@@ -41,8 +47,9 @@ static void set_status(struct m50_ctx *ctx, const char *text)
   pthread_mutex_unlock(&ctx->lock);
 }
 
-/* Copies BGRA into a persistent buffer, then outputs. OBS async owns nothing. */
-static void push_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, int stride)
+/* Worker only decodes into the latest-frame slot; the video thread pushes it
+ * out synchronously each tick so OBS never sits on a queue of stale frames. */
+static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, int stride)
 {
   size_t need = (size_t)h * (size_t)stride;
   pthread_mutex_lock(&ctx->lock);
@@ -56,14 +63,31 @@ static void push_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, i
     ctx->frame_cap = need;
   }
   memcpy(ctx->frame_buf, bgra, need);
+  ctx->frame_w = w;
+  ctx->frame_h = h;
+  ctx->frame_stride = stride;
+  ctx->frame_seq++;
+  pthread_mutex_unlock(&ctx->lock);
+}
+
+static void m50_tick(void *data, float seconds)
+{
+  (void)seconds;
+  struct m50_ctx *ctx = (struct m50_ctx *)data;
+  pthread_mutex_lock(&ctx->lock);
+  if (!ctx->frame_buf || ctx->frame_seq == ctx->frame_shown) {
+    pthread_mutex_unlock(&ctx->lock);
+    return;
+  }
   struct obs_source_frame frame;
   memset(&frame, 0, sizeof(frame));
   frame.format = VIDEO_FORMAT_BGRX;
-  frame.width = (uint32_t)w;
-  frame.height = (uint32_t)h;
-  frame.linesize[0] = (uint32_t)stride;
+  frame.width = (uint32_t)ctx->frame_w;
+  frame.height = (uint32_t)ctx->frame_h;
+  frame.linesize[0] = (uint32_t)ctx->frame_stride;
   frame.data[0] = ctx->frame_buf;
   frame.timestamp = os_gettime_ns();
+  ctx->frame_shown = ctx->frame_seq;
   obs_source_output_video(ctx->source, &frame);
   pthread_mutex_unlock(&ctx->lock);
 }
@@ -154,6 +178,7 @@ static void *capture_thread(void *arg)
     int transient_run = 0;
     long total_frames = 0;
     int wic_fails = 0;
+    DWORD last_keepalive = GetTickCount();
     while (ctx->running) {
       uint8_t *jpeg = NULL;
       int jlen = 0;
@@ -175,10 +200,16 @@ static void *capture_thread(void *arg)
         continue;
       }
       transient_run = 0;
+      /* Keepalive so the camera never idles to sleep mid-stream. */
+      if (GetTickCount() - last_keepalive > 3000) {
+        last_keepalive = GetTickCount();
+        if (m50_keepalive(s) != 0)
+          blog(LOG_WARNING, "[m50] keepalive poll failed");
+      }
       uint8_t *bgra = NULL;
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
-        push_frame(ctx, bgra, w, h, stride);
+        store_frame(ctx, bgra, w, h, stride);
         if (++total_frames == 1)
           blog(LOG_INFO, "[m50] first frame: %dx%d (%d bytes jpeg)", w, h, jlen);
         else if (total_frames % 1200 == 0)
@@ -355,11 +386,12 @@ static void m50_get_defaults(obs_data_t *settings)
 static struct obs_source_info m50_source_info = {
   .id = "m50_wifi_source",
   .type = OBS_SOURCE_TYPE_INPUT,
-  .output_flags = OBS_SOURCE_ASYNC_VIDEO,
+  .output_flags = OBS_SOURCE_VIDEO,
   .get_name = m50_get_name,
   .create = m50_create,
   .destroy = m50_destroy,
   .update = m50_update,
+  .video_tick = m50_tick,
   .get_properties = m50_properties,
   .get_defaults = m50_get_defaults,
   .icon_type = OBS_ICON_TYPE_CAMERA,

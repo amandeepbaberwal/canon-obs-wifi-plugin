@@ -827,6 +827,16 @@ static int extract_jpeg(const uint8_t *frame, int flen, uint8_t **out, int *out_
   return 0;
 }
 
+int m50_keepalive(m50_session *s)
+{
+  static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  uint8_t *d = NULL;
+  int dl = 0;
+  int r = cam_command(s, s->cmd, EOS_GET_EVENT, NULL, 0, acc, 3, &d, &dl, 10000);
+  free(d);
+  return r < 0 ? -1 : 0;
+}
+
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
