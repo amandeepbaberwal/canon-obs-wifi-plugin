@@ -70,8 +70,7 @@ static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, 
   pthread_mutex_unlock(&ctx->lock);
 }
 
-static void m50_tick(void *data, float seconds)
-{
+static void m50_tick(void *data, float seconds){
   (void)seconds;
   struct m50_ctx *ctx = (struct m50_ctx *)data;
   pthread_mutex_lock(&ctx->lock);
@@ -90,6 +89,18 @@ static void m50_tick(void *data, float seconds)
   ctx->frame_shown = ctx->frame_seq;
   obs_source_output_video(ctx->source, &frame);
   pthread_mutex_unlock(&ctx->lock);
+}
+
+static uint32_t m50_width(void *data)
+{
+  struct m50_ctx *ctx = (struct m50_ctx *)data;
+  return (uint32_t)(ctx->frame_w > 0 ? ctx->frame_w : 480);
+}
+
+static uint32_t m50_height(void *data)
+{
+  struct m50_ctx *ctx = (struct m50_ctx *)data;
+  return (uint32_t)(ctx->frame_h > 0 ? ctx->frame_h : 320);
 }
 
 static void *capture_thread(void *arg)
@@ -267,6 +278,8 @@ static void *m50_create(obs_data_t *settings, obs_source_t *source)
   snprintf(ctx->status, sizeof(ctx->status), "Starting.");
   ctx->camera_ip = bstrdup(obs_data_get_string(settings, "camera_ip"));
   ctx->local_address = bstrdup(obs_data_get_string(settings, "local_address"));
+  ctx->frame_w = 480;
+  ctx->frame_h = 320;
   m50_set_log(m50_blog);
   start_thread(ctx);
   return ctx;
@@ -392,6 +405,8 @@ static struct obs_source_info m50_source_info = {
   .destroy = m50_destroy,
   .update = m50_update,
   .video_tick = m50_tick,
+  .get_width = m50_width,
+  .get_height = m50_height,
   .get_properties = m50_properties,
   .get_defaults = m50_get_defaults,
   .icon_type = OBS_ICON_TYPE_CAMERA,
