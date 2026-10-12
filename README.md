@@ -11,7 +11,8 @@ Also includes the `bridge/` fallback: a PTP/IP → MJPEG bridge (`http://127.0.0
   `GetViewFinderData (0x9153)` polling with `0xa102` warm-up handling.
 - Key finding: DIGIC-8 EVF output `0xd1b0` is an enum (`0 none / 1 camera / 2 host /
   3 cameraAndHost`). The plugin writes `3` so the LCD stays live while frames go to
-  the PC. Verified output: **960x640 MJPEG** (camera limitation; OBS scales it).
+  the PC. Verified output: **up to 1024x576 MJPEG** (feed varies by session:
+  480x320, 960x640, 1024x576 observed; camera limitation, OBS scales it).
 - SSDP discovery for `SmartPhoneEOSSystemService` / `RemoteControlEOSSystemService` /
   `WFTEOSSystemService`, UPnP descriptor verify, auto-pick of the router-facing PC
   interface, CloseSession teardown, 10s reconnect backoff.
@@ -52,7 +53,8 @@ preserved (default `--evf-output 8`).
 
 ## Status / limits
 
-Working: pairing, 480x320 live view in OBS, reconnect, SSDP search. Limits: video-only
+Working: pairing, P + Movie mode live view in OBS, reconnect, SSDP search. Limits:
+video-only
 (no audio), fixed preview resolution, camera must stay awake on the waiting screen.
 M50 support is hardware-verified on this setup; other bodies are unverified.
 
