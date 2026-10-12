@@ -38,6 +38,8 @@ struct m50_ctx {
   int frame_stride;
   unsigned long frame_seq;
   unsigned long frame_shown;
+  unsigned long tick_outputs;
+  uint64_t frame_ts;
 };
 
 static void set_status(struct m50_ctx *ctx, const char *text)
@@ -49,7 +51,8 @@ static void set_status(struct m50_ctx *ctx, const char *text)
 
 /* Worker only decodes into the latest-frame slot; the video thread pushes it
  * out synchronously each tick so OBS never sits on a queue of stale frames. */
-static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, int stride)
+static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, int stride,
+                        uint64_t ts)
 {
   size_t need = (size_t)h * (size_t)stride;
   pthread_mutex_lock(&ctx->lock);
@@ -66,6 +69,7 @@ static void store_frame(struct m50_ctx *ctx, const uint8_t *bgra, int w, int h, 
   ctx->frame_w = w;
   ctx->frame_h = h;
   ctx->frame_stride = stride;
+  ctx->frame_ts = ts;
   ctx->frame_seq++;
   pthread_mutex_unlock(&ctx->lock);
 }
@@ -85,8 +89,12 @@ static void m50_tick(void *data, float seconds){
   frame.height = (uint32_t)ctx->frame_h;
   frame.linesize[0] = (uint32_t)ctx->frame_stride;
   frame.data[0] = ctx->frame_buf;
-  frame.timestamp = os_gettime_ns();
+  frame.timestamp = ctx->frame_ts;
   ctx->frame_shown = ctx->frame_seq;
+  ctx->tick_outputs++;
+  if (ctx->tick_outputs <= 3 || ctx->tick_outputs % 600 == 0)
+    blog(LOG_INFO, "[m50] tick output #%lu %dx%d ts=%llu", ctx->tick_outputs, ctx->frame_w,
+         ctx->frame_h, (unsigned long long)frame.timestamp);
   obs_source_output_video(ctx->source, &frame);
   pthread_mutex_unlock(&ctx->lock);
 }
@@ -221,7 +229,7 @@ static void *capture_thread(void *arg)
       uint8_t *bgra = NULL;
       int w = 0, h = 0, stride = 0;
       if (jpeg_to_bgra(jpeg, jlen, &bgra, &w, &h, &stride)) {
-        store_frame(ctx, bgra, w, h, stride);
+        store_frame(ctx, bgra, w, h, stride, os_gettime_ns());
         if (++total_frames == 1) {
           blog(LOG_INFO, "[m50] first frame: %dx%d (%d bytes jpeg)", w, h, jlen);
           /* Debug dump: %TEMP%\m50_firstframe.bmp for visual verification. */
