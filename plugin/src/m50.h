@@ -43,6 +43,7 @@ int m50_raw_connect(const char *host, int port, const char *local_address, int i
                     void **sess_out);
 int m50_raw_bootstrap(void *sess, int minimal);
 int m50_raw_bootstrap_tol(void *sess, int minimal, int tolerant);
+int m50_raw_evf(void *sess, int value);
 int m50_raw_vf(void *sess, int p2, int p3, uint8_t **out_jpeg, int *out_len);
 void m50_raw_close(void *sess);
 

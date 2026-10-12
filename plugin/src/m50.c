@@ -1027,6 +1027,20 @@ int m50_raw_vf(void *vs, int p2, int p3, uint8_t **out_jpeg, int *out_len)
   return 1;
 }
 
+int m50_raw_evf(void *vs, int value)
+{
+  m50_session *s = (m50_session *)vs;
+  uint8_t payload[12];
+  memset(payload, 0, sizeof(payload));
+  payload[0] = 12;
+  payload[4] = 0xb0;
+  payload[5] = 0xd1;
+  payload[8] = (uint8_t)value;
+  static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
+  int code = host_data_command(s, EOS_SET_PROP_EX, payload, 12, NULL, 0, acc, 3, 10000);
+  return code == R_OK ? 0 : -1;
+}
+
 int m50_get_frame(m50_session *s, uint8_t **out_jpeg, int *out_len)
 {
   static const uint16_t acc[] = { R_OK, R_BUSY, R_NOT_READY };
